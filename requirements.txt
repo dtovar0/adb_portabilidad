@@ -1,0 +1,31 @@
+# ===========================================================================
+# Dependencias Python del proceso de Portabilidad
+# ---------------------------------------------------------------------------
+# Instalar con:
+#   pip install -r requirements.txt
+# En sistemas con entorno gestionado (PEP 668, ej. Ubuntu 24.04):
+#   pip install --break-system-packages -r requirements.txt
+#   (o usar un virtualenv)
+# ===========================================================================
+
+# --- mtysajpsx01.py (ejecucion contra el equipo SONUS/EMS) ---
+pexpect==4.9.0            # sesion CLI/ssh interactiva
+python-dotenv==1.0.1      # carga de configuracion desde .env
+holidays==0.100           # dias festivos oficiales de Mexico (omitir festivos)
+
+# --- full_sync.py (comparacion de bases y generacion de diferencias) ---
+pandas==2.2.2             # manejo de los datasets y calculo del diff
+SQLAlchemy==2.0.48        # engines de conexion a las BD
+pyodbc==5.3.0             # conexion a la BD de Sistemas (ABD / MSSQL)
+oracledb==4.0.2           # conexion a la BD del equipo PSX (Oracle, reemplazo de cx_Oracle)
+
+# ---------------------------------------------------------------------------
+# NOTA (solo full_sync.py, MSSQL): pyodbc requiere ademas el driver NATIVO
+# "ODBC Driver 18 for SQL Server" + unixODBC, que NO se instalan con pip.
+# En Debian/Ubuntu:
+#   sudo apt-get install -y unixodbc
+#   # y el repo de Microsoft para msodbcsql18:
+#   # https://learn.microsoft.com/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server
+# oracledb funciona en modo 'thin' sin Oracle Client. Si tu BD Oracle exige
+# modo 'thick', instala tambien el Oracle Instant Client.
+# ---------------------------------------------------------------------------

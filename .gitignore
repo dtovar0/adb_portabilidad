@@ -1,0 +1,16 @@
+# === INICIO GITIGNORE ===
+venv/
+.env
+.env.example
+config.py
+config.conf
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+instance/
+.pytest_cache/
+secret.key
+*.zip
+*.sql
+# === FIN GITIGNORE ===
