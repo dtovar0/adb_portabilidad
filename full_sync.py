@@ -30,6 +30,7 @@ Uso:
 import argparse
 import os
 import sys
+import time
 
 # ---------------------------------------------------------------------------
 # Carga de variables desde .env (si esta disponible python-dotenv).
@@ -97,6 +98,29 @@ PREFIJOS_BASE = range(SYNC_BASE_FROM, SYNC_BASE_TO + 1)
 
 # Profundidad del loteo: 1 => prefijos base; 2/3 => se anexan digitos 0..9.
 SYNC_DEPTH = int(os.environ.get("SYNC_DEPTH", "1"))
+
+# Cada cuantos SEGUNDOS se imprime una linea de progreso al descargar cada BD.
+# El progreso es por tiempo (no por cantidad de filas): con decenas de millones
+# de registros mantiene un ritmo de log constante. 0 => sin lineas de progreso,
+# solo el resumen final.
+SYNC_PROGRESS_SECS = float(os.environ.get("SYNC_PROGRESS_SECS", "10"))
+
+
+def formatear_peso(num_bytes):
+  """Devuelve un tamano legible (B, KB, MB, GB) a partir de bytes."""
+  tam = float(num_bytes)
+  for unidad in ("B", "KB", "MB", "GB", "TB"):
+    if tam < 1024 or unidad == "TB":
+      return "%.1f %s" % (tam, unidad)
+    tam /= 1024
+
+
+def peso_archivo(ruta):
+  """Peso legible de un archivo; '?' si no se puede leer."""
+  try:
+    return formatear_peso(os.path.getsize(ruta))
+  except OSError:
+    return "?"
 
 
 def generar_prefijos(depth):
@@ -199,10 +223,30 @@ def engine_psx():
 # ---------------------------------------------------------------------------
 # Descarga de cada base
 # ---------------------------------------------------------------------------
+def _log_progreso(etiqueta, n, t0, siguiente_log):
+  """Imprime una linea de progreso solo si ya paso SYNC_PROGRESS_SECS desde la
+  ultima (progreso por tiempo, no por cantidad de filas). Muestra registros,
+  tiempo transcurrido y velocidad (reg/s). Devuelve el proximo instante en que
+  toca imprimir. La comprobacion es una simple resta de reloj: barata aunque se
+  llame en cada una de decenas de millones de iteraciones."""
+  if not SYNC_PROGRESS_SECS:
+    return siguiente_log
+  ahora = time.monotonic()
+  if ahora < siguiente_log:
+    return siguiente_log
+  transcurrido = ahora - t0
+  vel = (n / transcurrido) if transcurrido > 0 else 0
+  print("[FULL_SYNC]   %s: %s registros (%.0fs, %s reg/s) ..."
+        % (etiqueta, "{:,}".format(n), transcurrido, "{:,.0f}".format(vel)))
+  return ahora + SYNC_PROGRESS_SECS
+
+
 def descargar_abd():
-  """Descarga COMPLETA de la BD ABD (MSSQL) a abd.csv (una sola consulta).
-  Estructura: Number, Operador (sin header). El loteo se hace despues, al
-  procesar (split_abd/comparar). Solo trae portaciones vigentes/futuras."""
+  """Descarga COMPLETA de la BD ABD (MSSQL) a abd.csv por streaming (fila por
+  fila directo a disco, SIN cargar todo a memoria: la tabla puede tener decenas
+  de millones de filas). Estructura: Number, Operador (sin header). El loteo se
+  hace despues, al procesar. Solo trae portaciones vigentes/futuras.
+  Muestra progreso periodico y un resumen final (registros, peso, tiempo)."""
   eng = engine_abd()
   print("[FULL_SYNC] Descargando BD ABD (Sistemas/MSSQL) desde %s ..." % ABD_SERVER)
   q = (
@@ -211,16 +255,29 @@ def descargar_abd():
     "WHERE FinalPortDate >= GETDATE()"
     % ABD_DATABASE
   )
-  df = pd.read_sql_query(q, eng)
-  df.to_csv(os.path.join(SYNC_WORKDIR, "abd.csv"), index=False, header=False)
-  print("[FULL_SYNC]   ABD: %d registro(s)." % len(df))
-  del df
+
+  abd_path = os.path.join(SYNC_WORKDIR, "abd.csv")
+  t0 = time.monotonic()
+  siguiente_log = t0 + SYNC_PROGRESS_SECS
+  n = 0
+  with eng.connect() as conn:
+    # stream_results: cursor server-side, no bufferea toda la tabla en el cliente.
+    result = conn.execution_options(stream_results=True).exec_driver_sql(q)
+    with open(abd_path, "w") as f:
+      for row in result:
+        f.write("%s,%s\n" % (row[0], row[1]))
+        n += 1
+        siguiente_log = _log_progreso("ABD", n, t0, siguiente_log)
+
+  print("[FULL_SYNC]   ABD: %s registro(s) | %s | %.1fs."
+        % ("{:,}".format(n), peso_archivo(abd_path), time.monotonic() - t0))
 
 
 def descargar_psx():
   """Descarga COMPLETA de la BD PSX (Oracle, NUMBER_TRANSLATION_DATA) a psx.csv
-  (una sola consulta). Estructura: number, operator (3 primeros chars del
-  TRANSLATED_NATIONAL_ID). El loteo se hace despues, al procesar."""
+  por streaming (fila por fila directo a disco). Estructura: number, operator
+  (3 primeros chars del TRANSLATED_NATIONAL_ID). El loteo se hace despues.
+  Muestra progreso periodico y un resumen final (registros, peso, tiempo)."""
   eng = engine_psx()
   print("[FULL_SYNC] Descargando BD PSX (Oracle) desde %s:%s/%s ..."
         % (PSX_HOST, PSX_PORT, PSX_SID))
@@ -228,10 +285,12 @@ def descargar_psx():
   psx_path = os.path.join(SYNC_WORKDIR, "psx.csv")
   fail_path = os.path.join(SYNC_WORKDIR, "psx_fail.csv")
 
+  t0 = time.monotonic()
+  siguiente_log = t0 + SYNC_PROGRESS_SECS
   ok = 0
   fail = 0
   with eng.connect() as conn:
-    result = conn.exec_driver_sql(
+    result = conn.execution_options(stream_results=True).exec_driver_sql(
       "select NATIONAL_ID, TRANSLATED_NATIONAL_ID from NUMBER_TRANSLATION_DATA"
     )
     with open(psx_path, "w") as f, open(fail_path, "w") as t:
@@ -243,7 +302,11 @@ def descargar_psx():
         except Exception:
           t.write("%s,\n" % (row,))
           fail += 1
-  print("[FULL_SYNC]   PSX: %d registro(s) OK, %d con formato invalido." % (ok, fail))
+        siguiente_log = _log_progreso("PSX", ok + fail, t0, siguiente_log)
+
+  print("[FULL_SYNC]   PSX: %s registro(s) OK, %s con formato invalido | %s | %.1fs."
+        % ("{:,}".format(ok), "{:,}".format(fail), peso_archivo(psx_path),
+           time.monotonic() - t0))
 
 
 def split_por_prefijo(base, prefijos):
