@@ -85,6 +85,28 @@ Sistemas afectados: `full_sync.py`, directorio de trabajo (`SYNC_WORKDIR`).
 
 ---
 
+### Regla: Origen de los datos de cada base
+**Descripción:** Del ABD (MSSQL, tabla `Portability`) se traen solo las portaciones **vigentes o futuras**: `WHERE FinalPortDate >= GETDATE()` (con `NOLOCK`); las columnas son `Number` y `CarrierRecipientId` (operador). Del PSX (Oracle, tabla `NUMBER_TRANSLATION_DATA`) se traen `NATIONAL_ID` y `TRANSLATED_NATIONAL_ID`; el operador se deriva de los **primeros 3 caracteres** del `TRANSLATED_NATIONAL_ID`. Las filas del PSX con formato inválido (que no permiten derivar el operador) se apartan en `psx_fail.csv` y se cuentan, sin abortar el proceso.
+
+### Ejemplo
+Un número del ABD con `FinalPortDate` ya pasada no se incluye en la comparación. Una fila del PSX cuyo `TRANSLATED_NATIONAL_ID` no tiene los 3 caracteres esperados va a `psx_fail.csv`.
+
+### Impacto
+Sistemas afectados: Base de datos ABD (MSSQL), Base de datos PSX (Oracle).
+
+---
+
+### Regla: Formato de los comandos put (alta) y delete (baja)
+**Descripción:** Por cada diferencia se genera una línea de comando para el `batch_script` del equipo SONUS/EMS. El alta (`put`) fija `Country_Id`/`Translated_Country_Id` = `COUNTRY_ID` (México=52), `Translation_Label_Id` = `TRANSLATION_LABEL_ID` (00_TL_dummy) y arma `Translated_National_Id` como `{operador}{TRANSLATED_PREFIX}{numero}` (prefijo intercalado 177). La baja (`delete`) referencia el número con `Country_Id`. Estas constantes del protocolo son configurables desde el `.env` (`COUNTRY_ID`, `TRANSLATED_PREFIX`, `TRANSLATION_LABEL_ID`); solo cambian si se opera numeración de otro país.
+
+### Ejemplo
+Para el número `5512345678` con operador `ABC`: el `put` incluye `Country_Id 52 ... Translated_National_Id ABC1775512345678`.
+
+### Impacto
+Sistemas afectados: `full_sync.py`, Equipo SONUS/EMS.
+
+---
+
 ## Módulo: Portabilidad (mtysajpsx01)
 
 ### Regla: Dos modos de ejecución — fecha (día a día) y snapshot
@@ -106,5 +128,38 @@ Ante caída del equipo tras agotar reintentos y ciclos de recuperación, el proc
 
 ### Impacto
 Sistemas afectados: `mtysajpsx01.py`, Equipo SONUS/EMS, notificaciones por correo (SMTP).
+
+---
+
+### Regla: Particionado en chunks con header ?EMS::CLI?
+**Descripción:** Cada CSV de comandos se parte en chunks de `CHUNK_SIZE` líneas (una "parte" por chunk) y entre partes se espera `SLEEP_BETWEEN` segundos. La parte 1 NO lleva header; las partes 2..N se anteponen con la línea `?EMS::CLI?` (convención requerida por el equipo). El número de partes es `ceil(total_lineas / CHUNK_SIZE)` con mínimo 1, incluso si el archivo está vacío.
+
+### Ejemplo
+Un archivo de 45,000 líneas con `CHUNK_SIZE=20000` genera 3 partes: la parte 1 sin header, y las partes 2 y 3 comenzando con `?EMS::CLI?`.
+
+### Impacto
+Sistemas afectados: `mtysajpsx01.py`, Equipo SONUS/EMS.
+
+---
+
+### Regla: Omisión de domingos y festivos (solo modo fecha)
+**Descripción:** En el proceso día a día se omiten domingos (`SKIP_SUNDAY`) y festivos oficiales de México vía la librería `holidays`, más festivos extra definidos manualmente (`EXTRA_HOLIDAYS`, formato `YYYY-MM-DD`) cuando `SKIP_HOLIDAYS=true`. `SKIP_CHECK_DATE` decide qué fecha se evalúa: `run` = la fecha de ejecución (hoy), `data` = la fecha de los datos (`--date`). El calendario NO aplica al modo snapshot ni al full sync.
+
+### Ejemplo
+Con `SKIP_SUNDAY=true`, ejecutar `--date 20260719` (domingo) imprime `[OMITIDO] ... domingo` y no procesa ese día, continuando con el resto del rango.
+
+### Impacto
+Sistemas afectados: `mtysajpsx01.py`.
+
+---
+
+### Regla: Notificaciones por correo (inicio, fin, error)
+**Descripción:** El proceso envía correos según toggles independientes: `NOTIFY_START` (al iniciar un día), `NOTIFY_END` (al terminar correctamente) y `NOTIFY_ERROR` (ante fallo, servidor caído o rango abortado). El envío usa SMTP (`SMTP_HOST`/`SMTP_PORT`, con `SMTP_TLS` y credenciales opcionales) desde `MAIL_FROM` hacia `MAIL_TO`. Un fallo al enviar la notificación NO aborta el proceso; solo se reporta.
+
+### Ejemplo
+Con `NOTIFY_ERROR=true`, si un día falla se envía un correo `[Portabilidad] ERROR ...` con host, tipo, fecha, partes procesadas y detalle del fallo.
+
+### Impacto
+Sistemas afectados: `mtysajpsx01.py`, servidor SMTP, destinatarios (`MAIL_TO`).
 
 ---
