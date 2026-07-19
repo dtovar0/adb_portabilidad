@@ -147,6 +147,13 @@ SYNC_KEEP_INTERMEDIATE = env_bool("SYNC_KEEP_INTERMEDIATE", False)
 # Habilita el loteo al procesar. Si es False, se compara todo de una sola pasada.
 SYNC_BATCH_ENABLED = env_bool("SYNC_BATCH_ENABLED", True)
 
+# Saltar la descarga de una BD y REUSAR el CSV que quedo de una corrida anterior
+# (abd.csv / psx.csv en el workdir). Util para re-comparar sin volver a bajar
+# decenas de millones de filas. Requiere que esa corrida previa haya dejado el
+# intermedio (SYNC_KEEP_INTERMEDIATE=true); si el CSV no existe, se aborta.
+SKIP_ABD = env_bool("SKIP_ABD", False)
+SKIP_PSX = env_bool("SKIP_PSX", False)
+
 
 # ---------------------------------------------------------------------------
 # Validacion de configuracion obligatoria
@@ -204,18 +211,26 @@ def engine_abd():
 
 def engine_psx():
   """Crea el engine SQLAlchemy hacia la BD del equipo PSX (Oracle).
-  Usa python-oracledb (recomendado) o cx_Oracle como fallback."""
+
+  Usa python-oracledb (recomendado) con el dialecto nativo 'oracle+oracledb'
+  de SQLAlchemy 1.4.30+/2.0. Si solo esta disponible el antiguo cx_Oracle, cae
+  al dialecto 'oracle+cx_oracle'. Se evita el truco de disfrazar oracledb como
+  cx_Oracle: ese dialecto valida la version de cx_Oracle y rechaza a oracledb
+  ('cx_Oracle version 8 and above are supported')."""
   try:
     import oracledb
+    dialecto = "oracle+oracledb"
     dsn = oracledb.makedsn(PSX_HOST, PSX_PORT, sid=PSX_SID)
-    # Registra oracledb como reemplazo de cx_Oracle para el dialecto de SQLAlchemy.
-    sys.modules.setdefault("cx_Oracle", oracledb)
   except ImportError:
     import cx_Oracle
+    dialecto = "oracle+cx_oracle"
     dsn = cx_Oracle.makedsn(PSX_HOST, PSX_PORT, sid=PSX_SID)
 
-  cstr = "oracle://{user}:{password}@{dsn}".format(
-    user=PSX_USER, password=PSX_PASSWORD, dsn=dsn
+  cstr = "{dialecto}://{user}:{password}@{dsn}".format(
+    dialecto=dialecto,
+    user=urllib.parse.quote_plus(PSX_USER),
+    password=urllib.parse.quote_plus(PSX_PASSWORD),
+    dsn=dsn,
   )
   return sal.create_engine(cstr)
 
@@ -307,6 +322,41 @@ def descargar_psx():
   print("[FULL_SYNC]   PSX: %s registro(s) OK, %s con formato invalido | %s | %.1fs."
         % ("{:,}".format(ok), "{:,}".format(fail), peso_archivo(psx_path),
            time.monotonic() - t0))
+
+
+def contar_abd():
+  """Cuenta los registros de la BD ABD (MSSQL) sin descargarla (SELECT COUNT(*)
+  con el MISMO filtro que la descarga). Devuelve el total; imprime tiempo."""
+  eng = engine_abd()
+  print("[FULL_SYNC] Contando BD ABD (Sistemas/MSSQL) desde %s ..." % ABD_SERVER)
+  q = (
+    "SELECT COUNT(*) "
+    "FROM [%s].[dbo].[Portability] (NOLOCK) "
+    "WHERE FinalPortDate >= GETDATE()"
+    % ABD_DATABASE
+  )
+  t0 = time.monotonic()
+  with eng.connect() as conn:
+    total = conn.exec_driver_sql(q).scalar()
+  print("[FULL_SYNC]   ABD: %s registro(s) | %.1fs."
+        % ("{:,}".format(total or 0), time.monotonic() - t0))
+  return total or 0
+
+
+def contar_psx():
+  """Cuenta los registros de la BD PSX (Oracle, NUMBER_TRANSLATION_DATA) sin
+  descargarla (SELECT COUNT(*)). Devuelve el total; imprime tiempo."""
+  eng = engine_psx()
+  print("[FULL_SYNC] Contando BD PSX (Oracle) desde %s:%s/%s ..."
+        % (PSX_HOST, PSX_PORT, PSX_SID))
+  t0 = time.monotonic()
+  with eng.connect() as conn:
+    total = conn.exec_driver_sql(
+      "select count(*) from NUMBER_TRANSLATION_DATA"
+    ).scalar()
+  print("[FULL_SYNC]   PSX: %s registro(s) | %.1fs."
+        % ("{:,}".format(total or 0), time.monotonic() - t0))
+  return total or 0
 
 
 def split_por_prefijo(base, prefijos):
@@ -453,9 +503,22 @@ def main():
                            "Sin etiqueta se sobrescriben <PREFIX>_<TYPE>.csv.")
   parser.add_argument("--no-execute", dest="no_execute", action="store_true",
                       help="Solo generar los CSV de diferencias; no ejecutarlos contra el equipo.")
+  parser.add_argument("--count", action="store_true",
+                      help="Solo contar los registros de cada BD (SELECT COUNT(*)) "
+                           "sin descargar ni comparar. Rapido, para diagnostico.")
   args = parser.parse_args()
 
   label = (args.label or "").strip()
+
+  # --- Modo conteo: solo cuenta y termina (no descarga, no compara, no ejecuta) ---
+  if args.count:
+    validar_configuracion()
+    abd_n = contar_abd()
+    psx_n = contar_psx()
+    print("[FULL_SYNC] Conteo: ABD=%s | PSX=%s | diferencia=%s."
+          % ("{:,}".format(abd_n), "{:,}".format(psx_n),
+             "{:+,}".format(abd_n - psx_n)))
+    return 0
 
   # Valida que toda la configuracion obligatoria provenga del .env antes de operar.
   validar_configuracion()
@@ -480,9 +543,31 @@ def main():
     prefijos = [""]
     print("[FULL_SYNC] Loteo DESHABILITADO: comparacion en una sola pasada.")
 
-  # 1) Descarga COMPLETA de ambas bases (una consulta por base).
-  descargar_abd()
-  descargar_psx()
+  # 1) Descarga de cada base (o reuso del CSV previo si SKIP_ABD/SKIP_PSX).
+  #    Al saltar una descarga se REUSA el intermedio de una corrida anterior
+  #    (requiere SYNC_KEEP_INTERMEDIATE=true en aquella). Si el CSV no existe,
+  #    se aborta: comparar con una base ausente generaria diffs incorrectos
+  #    (en un full sync eso implica altas/bajas indebidas).
+  def _reusar_o_error(base):
+    ruta = os.path.join(SYNC_WORKDIR, "%s.csv" % base)
+    if not os.path.isfile(ruta):
+      print("[ERROR] SKIP_%s=true pero no existe el CSV a reusar: %s\n"
+            "        Genera uno con una corrida previa que use "
+            "SYNC_KEEP_INTERMEDIATE=true, o desactiva SKIP_%s."
+            % (base.upper(), ruta, base.upper()), file=sys.stderr)
+      sys.exit(2)
+    print("[FULL_SYNC] SKIP_%s=true: se reusa %s (%s)."
+          % (base.upper(), ruta, peso_archivo(ruta)))
+
+  if SKIP_ABD:
+    _reusar_o_error("abd")
+  else:
+    descargar_abd()
+
+  if SKIP_PSX:
+    _reusar_o_error("psx")
+  else:
+    descargar_psx()
 
   # 2) Troceo por prefijo (si el loteo esta activo) y comparacion. comparar()
   #    carga solo un lote por lado a la vez (control de memoria).
