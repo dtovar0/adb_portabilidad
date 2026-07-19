@@ -503,22 +503,33 @@ def main():
                            "Sin etiqueta se sobrescriben <PREFIX>_<TYPE>.csv.")
   parser.add_argument("--no-execute", dest="no_execute", action="store_true",
                       help="Solo generar los CSV de diferencias; no ejecutarlos contra el equipo.")
-  parser.add_argument("--count", action="store_true",
-                      help="Solo contar los registros de cada BD (SELECT COUNT(*)) "
-                           "sin descargar ni comparar. Rapido, para diagnostico.")
+  parser.add_argument("--check", action="store_true",
+                      help="Solo valida la cantidad de registros de cada BD "
+                           "(SELECT COUNT(*)) sin descargar ni comparar. ABD es el "
+                           "master y PSX el slave: deben coincidir. Sale con codigo "
+                           "1 si NO coinciden, para uso en scripts/monitoreo.")
   args = parser.parse_args()
 
   label = (args.label or "").strip()
 
-  # --- Modo conteo: solo cuenta y termina (no descarga, no compara, no ejecuta) ---
-  if args.count:
+  # --- Modo check: valida que el slave (PSX) tenga los mismos registros que el
+  #     master (ABD). Solo cuenta (rapido), no descarga ni compara ni ejecuta.
+  if args.check:
     validar_configuracion()
-    abd_n = contar_abd()
-    psx_n = contar_psx()
-    print("[FULL_SYNC] Conteo: ABD=%s | PSX=%s | diferencia=%s."
+    abd_n = contar_abd()   # master
+    psx_n = contar_psx()   # slave
+    diff = abd_n - psx_n
+    if diff == 0:
+      print("[FULL_SYNC] CHECK OK: ABD (master)=%s == PSX (slave)=%s. Cuadran."
+            % ("{:,}".format(abd_n), "{:,}".format(psx_n)))
+      return 0
+    faltan = "faltan %s en PSX" % "{:,}".format(diff) if diff > 0 \
+        else "sobran %s en PSX" % "{:,}".format(-diff)
+    print("[FULL_SYNC] CHECK FALLO: ABD (master)=%s != PSX (slave)=%s "
+          "(diferencia=%s; %s). Corre el full sync para igualarlos."
           % ("{:,}".format(abd_n), "{:,}".format(psx_n),
-             "{:+,}".format(abd_n - psx_n)))
-    return 0
+             "{:+,}".format(diff), faltan), file=sys.stderr)
+    return 1
 
   # Valida que toda la configuracion obligatoria provenga del .env antes de operar.
   validar_configuracion()
