@@ -1,7 +1,5 @@
 # 📚 Reglas de Negocio — Portabilidad
 
-> Archivo append-only. No sobrescribir entradas existentes.
-
 ---
 
 ## Módulo: General
