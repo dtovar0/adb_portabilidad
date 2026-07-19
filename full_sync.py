@@ -23,13 +23,13 @@ Este script SOLO genera los CSV; la ejecucion la realiza mtysajpsx01.py
 (invocado, por ejemplo, desde run_abd.sh).
 
 Uso:
-    python3 full_sync.py --date YYYYMMDD
-    python3 full_sync.py                     # usa la fecha de hoy
+    python3 full_sync.py                 # genera y ejecuta el snapshot completo
+    python3 full_sync.py --no-execute    # solo genera los CSV, no los ejecuta
+    python3 full_sync.py --label prueba  # etiqueta opcional en el nombre del CSV
 """
 import argparse
 import os
 import sys
-from datetime import date
 
 # ---------------------------------------------------------------------------
 # Carga de variables desde .env (si esta disponible python-dotenv).
@@ -43,6 +43,11 @@ except ImportError:
 import pandas as pd
 import sqlalchemy as sal
 import urllib.parse
+
+# Modulo hermano que ejecuta las diferencias contra el equipo (scp + batch_script
+# remoto, con chunks/reintentos/recuperacion/checkpoint). Importarlo es seguro:
+# toda su logica esta en funciones (no corre nada a nivel de modulo).
+import mtysajpsx01
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +69,22 @@ PSX_USER = os.environ.get("PSX_USER", "")
 PSX_PASSWORD = os.environ.get("PSX_PASSWORD", "")
 
 # Rutas y parametros
-FILE_PREFIX = os.environ.get("FILE_PREFIX", "MTYSAJPSX01")
-DIRFILES = os.environ.get("DIRFILES", "/home/airflow/portabilidad")
+FILE_PREFIX = os.environ.get("FILE_PREFIX", "")
+DIRFILES = os.environ.get("DIRFILES", "")
 SYNC_WORKDIR = os.environ.get("SYNC_WORKDIR", "").strip() or DIRFILES
+
+# ---------------------------------------------------------------------------
+# Constantes del protocolo CLI del equipo (externalizadas al .env).
+# Son valores del formato de los comandos put/delete del equipo SONUS/EMS.
+# Sus defaults conservan el comportamiento historico; ajustalos en el .env si
+# operas otra numeracion/pais.
+#   COUNTRY_ID          -> Country_Id / Translated_Country_Id (Mexico = 52)
+#   TRANSLATED_PREFIX   -> prefijo intercalado en Translated_National_Id (177)
+#   TRANSLATION_LABEL_ID-> Translation_Label_Id (00_TL_dummy)
+# ---------------------------------------------------------------------------
+COUNTRY_ID = os.environ.get("COUNTRY_ID", "52").strip()
+TRANSLATED_PREFIX = os.environ.get("TRANSLATED_PREFIX", "177").strip()
+TRANSLATION_LABEL_ID = os.environ.get("TRANSLATION_LABEL_ID", "00_TL_dummy").strip()
 
 # Digitos base del primer nivel de loteo (rango inicio-fin, inclusive), desde el
 # .env. Cubren el universo de numeracion; por defecto 2..9.
@@ -104,6 +122,44 @@ def env_bool(name, default=False):
 SYNC_KEEP_INTERMEDIATE = env_bool("SYNC_KEEP_INTERMEDIATE", False)
 # Habilita el loteo al procesar. Si es False, se compara todo de una sola pasada.
 SYNC_BATCH_ENABLED = env_bool("SYNC_BATCH_ENABLED", True)
+
+
+# ---------------------------------------------------------------------------
+# Validacion de configuracion obligatoria
+# ---------------------------------------------------------------------------
+def validar_configuracion():
+  """Verifica que las variables obligatorias esten definidas en el entorno/.env.
+  Aborta con un mensaje claro si falta alguna, en lugar de fallar de forma
+  confusa al conectar a una BD con datos vacios o generar CSV sin prefijo."""
+  requeridas = {
+    # BD ABD (MSSQL)
+    "ABD_DRIVER": ABD_DRIVER,
+    "ABD_SERVER": ABD_SERVER,
+    "ABD_DATABASE": ABD_DATABASE,
+    "ABD_USER": ABD_USER,
+    "ABD_PASSWORD": ABD_PASSWORD,
+    # BD PSX (Oracle)
+    "PSX_HOST": PSX_HOST,
+    "PSX_PORT": PSX_PORT,
+    "PSX_SID": PSX_SID,
+    "PSX_USER": PSX_USER,
+    "PSX_PASSWORD": PSX_PASSWORD,
+    # Rutas y salida
+    "FILE_PREFIX": FILE_PREFIX,
+    "DIRFILES": DIRFILES,
+    # Constantes del protocolo CLI
+    "COUNTRY_ID": COUNTRY_ID,
+    "TRANSLATED_PREFIX": TRANSLATED_PREFIX,
+    "TRANSLATION_LABEL_ID": TRANSLATION_LABEL_ID,
+  }
+  faltantes = [nombre for nombre, valor in requeridas.items() if not str(valor).strip()]
+  if faltantes:
+    print("[ERROR] Faltan variables obligatorias en el .env: %s"
+          % ", ".join(faltantes), file=sys.stderr)
+    print("[ERROR] Define esas variables en %s"
+          % os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+          file=sys.stderr)
+    sys.exit(2)
 
 
 # ---------------------------------------------------------------------------
@@ -211,20 +267,20 @@ def split_por_prefijo(base, prefijos):
 def comando_put(num, operator):
   """Genera la linea de comando 'put' (alta) para el batch_script del equipo."""
   return (
-    f'put Number_Translation National_Id {num} Country_Id 52 Attributes 0x0 '
+    f'put Number_Translation National_Id {num} Country_Id {COUNTRY_ID} Attributes 0x0 '
     f'Call_Processing_Element1_Id "" Call_Processing_Element2_Id "" '
     f'Call_Processing_Element3_Id "" Call_Processing_Element4_Id "" '
     f'Call_Processing_Element_Type 0 Direct_Translation_Flag 0x2 '
-    f'Translated_Country_Id 52 Translated_Carrier_Id "" Translated_Npi 1 '
-    f'Translated_Noa 3 Translation_Label_Id 00_TL_dummy '
-    f'Translated_National_Id {operator}177{num} \n'
+    f'Translated_Country_Id {COUNTRY_ID} Translated_Carrier_Id "" Translated_Npi 1 '
+    f'Translated_Noa 3 Translation_Label_Id {TRANSLATION_LABEL_ID} '
+    f'Translated_National_Id {operator}{TRANSLATED_PREFIX}{num} \n'
   )
 
 
 def comando_delete(num):
   """Genera la linea de comando 'delete' (baja) para el batch_script del equipo."""
   return (
-    f'delete Number_Translation National_Id {num} Country_Id 52 Attributes 0x0 '
+    f'delete Number_Translation National_Id {num} Country_Id {COUNTRY_ID} Attributes 0x0 '
     f'Call_Processing_Element1_Id "" Call_Processing_Element2_Id "" '
     f'Call_Processing_Element3_Id "" Call_Processing_Element4_Id "" '
     f'Call_Processing_Element_Type 0\n'
@@ -289,12 +345,14 @@ def comparar(prefijos):
   return lineas_put, lineas_del
 
 
-def escribir_salida(tipo, fecha, lineas):
+def escribir_salida(tipo, label, lineas):
   """Escribe el CSV consolidado que ejecutara mtysajpsx01.py.
+  El nombre se construye con mtysajpsx01.nombre_base para que coincida
+  exactamente con lo que el ejecutor buscara: <PREFIX>_<TYPE>[_<label>].csv.
   El header '?EMS::CLI?' NO se agrega aqui: mtysajpsx01.extract_lines lo antepone
   automaticamente a las partes 2..N. La parte 1 (sin header) es la convencion
   actual del pipeline."""
-  destino = os.path.join(DIRFILES, f"{FILE_PREFIX}_{tipo}_{fecha}.csv")
+  destino = os.path.join(DIRFILES, "%s.csv" % mtysajpsx01.nombre_base(tipo, label))
   with open(destino, "w") as f:
     f.writelines(lineas)
   print("[FULL_SYNC] Generado %s (%d comando(s))." % (destino, len(lineas)))
@@ -321,11 +379,27 @@ def limpiar_intermedios(prefijos):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-  parser = argparse.ArgumentParser(description="Full sync: compara ABD vs PSX y genera diferencias")
-  parser.add_argument("--date", type=str, help="Fecha para nombrar los CSV (YYYYMMDD). Default: hoy.")
+  parser = argparse.ArgumentParser(
+    description="Full sync: compara las dos tablas completas de numeros "
+                "(ABD vs PSX), genera las diferencias y las ejecuta contra el "
+                "equipo (salvo --no-execute). No maneja fechas: siempre es un "
+                "snapshot del estado total.")
+  parser.add_argument("--label", type=str,
+                      help="Etiqueta opcional para distinguir esta corrida en el "
+                           "nombre de los CSV: <PREFIX>_<TYPE>[_<label>].csv. "
+                           "Sin etiqueta se sobrescriben <PREFIX>_<TYPE>.csv.")
+  parser.add_argument("--no-execute", dest="no_execute", action="store_true",
+                      help="Solo generar los CSV de diferencias; no ejecutarlos contra el equipo.")
   args = parser.parse_args()
 
-  fecha = args.date if args.date else date.today().strftime("%Y%m%d")
+  label = (args.label or "").strip()
+
+  # Valida que toda la configuracion obligatoria provenga del .env antes de operar.
+  validar_configuracion()
+  # Si tambien se va a ejecutar contra el equipo, valida esa config AHORA para
+  # fallar temprano (antes de descargar las BD), no despues de generar los CSV.
+  if not args.no_execute:
+    mtysajpsx01.validar_configuracion()
 
   os.makedirs(SYNC_WORKDIR, exist_ok=True)
   os.makedirs(DIRFILES, exist_ok=True)
@@ -353,13 +427,37 @@ def main():
   split_por_prefijo("psx", prefijos)
   lineas_put, lineas_del = comparar(prefijos)
 
-  escribir_salida("PORTED", fecha, lineas_put)
-  escribir_salida("DELETED", fecha, lineas_del)
+  escribir_salida("PORTED", label, lineas_put)
+  escribir_salida("DELETED", label, lineas_del)
 
   limpiar_intermedios(prefijos)
-  print("[FULL_SYNC] Listo. Ejecuta las diferencias con mtysajpsx01.py "
-        "(--type PORTED / --type DELETED --date %s)." % fecha)
+
+  # 3) Ejecucion de las diferencias contra el equipo (salvo --no-execute).
+  #    Reutiliza el pipeline completo de mtysajpsx01 (chunks, reintentos,
+  #    recuperacion/reboot y checkpoint) para PORTED (altas) y DELETED (bajas).
+  if args.no_execute:
+    sufijo = (" --label %s" % label) if label else ""
+    print("[FULL_SYNC] Listo (solo generacion). Para ejecutar las diferencias: "
+          "python3 mtysajpsx01.py --type PORTED%s  (y --type DELETED%s)"
+          % (sufijo, sufijo))
+    return 0
+
+  print("[FULL_SYNC] Ejecutando ALTAS (PORTED) contra el equipo ...")
+  rc_ported = mtysajpsx01.run("PORTED", label=label)
+
+  print("[FULL_SYNC] Ejecutando BAJAS (DELETED) contra el equipo ...")
+  rc_deleted = mtysajpsx01.run("DELETED", label=label)
+
+  rc = rc_ported or rc_deleted
+  etiqueta = (" [%s]" % label) if label else ""
+  if rc == 0:
+    print("[FULL_SYNC] Full sync%s finalizado correctamente." % etiqueta)
+  else:
+    print("[FULL_SYNC] Full sync%s finalizo con errores "
+          "(PORTED=%d, DELETED=%d)." % (etiqueta, rc_ported, rc_deleted),
+          file=sys.stderr)
+  return rc
 
 
 if __name__ == "__main__":
-  main()
+  sys.exit(main())

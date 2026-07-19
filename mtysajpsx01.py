@@ -39,8 +39,8 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "25"))
 SMTP_USER = os.environ.get("SMTP_USER", "").strip()
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
 SMTP_TLS = env_bool("SMTP_TLS", False)
-MAIL_FROM = os.environ.get("MAIL_FROM", "portabilidad@vivaro.com")
-MAIL_TO = [x.strip() for x in os.environ.get("MAIL_TO", "dtovar@vivaro.com").split(",") if x.strip()]
+MAIL_FROM = os.environ.get("MAIL_FROM", "")
+MAIL_TO = [x.strip() for x in os.environ.get("MAIL_TO", "").split(",") if x.strip()]
 
 # ---------------------------------------------------------------------------
 # Configuracion de conexion
@@ -50,7 +50,7 @@ SSH_PORT = os.environ.get("SSH_PORT", "")
 SSH_USER = os.environ.get("SSH_USER", "")
 CLI_PASSWORD = os.environ.get("CLI_PASSWORD", "")
 CLI_INSTANCE = os.environ.get("CLI_INSTANCE", "")
-FILE_PREFIX = os.environ.get("FILE_PREFIX", "MTYSAJPSX01")
+FILE_PREFIX = os.environ.get("FILE_PREFIX", "")
 SCP_USER = os.environ.get("SCP_USER", "")
 SCP_DEST_PATH = os.environ.get("SCP_DEST_PATH", "")
 
@@ -74,9 +74,9 @@ CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "").strip() or LOG_DIR
 # ---------------------------------------------------------------------------
 RECOVERY_ENABLED = env_bool("RECOVERY_ENABLED", False)
 RECOVERY_SSH_HOST = os.environ.get("RECOVERY_SSH_HOST", "").strip()
-RECOVERY_SSH_PORT = os.environ.get("RECOVERY_SSH_PORT", "22").strip()
-RECOVERY_SSH_USER = os.environ.get("RECOVERY_SSH_USER", "root").strip()
-RECOVERY_CMD = os.environ.get("RECOVERY_CMD", "reboot").strip()
+RECOVERY_SSH_PORT = os.environ.get("RECOVERY_SSH_PORT", "").strip()
+RECOVERY_SSH_USER = os.environ.get("RECOVERY_SSH_USER", "").strip()
+RECOVERY_CMD = os.environ.get("RECOVERY_CMD", "").strip()
 RECOVERY_WAIT = int(os.environ.get("RECOVERY_WAIT", "180"))
 RECOVERY_MAX_CYCLES = int(os.environ.get("RECOVERY_MAX_CYCLES", "1"))
 RECOVERY_TIMEOUT = int(os.environ.get("RECOVERY_TIMEOUT", "60"))
@@ -88,6 +88,54 @@ SKIP_SUNDAY = env_bool("SKIP_SUNDAY", True)
 SKIP_HOLIDAYS = env_bool("SKIP_HOLIDAYS", True)
 EXTRA_HOLIDAYS = [x.strip() for x in os.environ.get("EXTRA_HOLIDAYS", "").split(",") if x.strip()]
 SKIP_CHECK_DATE = os.environ.get("SKIP_CHECK_DATE", "run").strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# Validacion de configuracion obligatoria
+# ---------------------------------------------------------------------------
+def validar_configuracion():
+  """Verifica que las variables obligatorias esten definidas en el entorno/.env.
+  Aborta con un mensaje claro si falta alguna, en lugar de fallar de forma
+  confusa mas adelante (ssh a un host vacio, archivos con prefijo vacio, etc.)."""
+  requeridas = {
+    "SSH_HOST": SSH_HOST,
+    "SSH_PORT": SSH_PORT,
+    "SSH_USER": SSH_USER,
+    "CLI_PASSWORD": CLI_PASSWORD,
+    "CLI_INSTANCE": CLI_INSTANCE,
+    "FILE_PREFIX": FILE_PREFIX,
+    "SCP_USER": SCP_USER,
+    "SCP_DEST_PATH": SCP_DEST_PATH,
+    "DIRFILES": DIRFILES,
+    "LOG_DIR": LOG_DIR,
+  }
+  faltantes = [nombre for nombre, valor in requeridas.items() if not str(valor).strip()]
+
+  # Si las notificaciones estan activas, tambien se requiere el correo.
+  if NOTIFY_START or NOTIFY_END or NOTIFY_ERROR:
+    if not MAIL_FROM.strip():
+      faltantes.append("MAIL_FROM")
+    if not MAIL_TO:
+      faltantes.append("MAIL_TO")
+
+  # Si la recuperacion esta activa, se requieren sus parametros.
+  if RECOVERY_ENABLED:
+    for nombre, valor in {
+      "RECOVERY_SSH_HOST": RECOVERY_SSH_HOST,
+      "RECOVERY_SSH_PORT": RECOVERY_SSH_PORT,
+      "RECOVERY_SSH_USER": RECOVERY_SSH_USER,
+      "RECOVERY_CMD": RECOVERY_CMD,
+    }.items():
+      if not str(valor).strip():
+        faltantes.append(nombre)
+
+  if faltantes:
+    print("[ERROR] Faltan variables obligatorias en el .env: %s"
+          % ", ".join(faltantes), file=sys.stderr)
+    print("[ERROR] Define esas variables en %s"
+          % os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+          file=sys.stderr)
+    sys.exit(2)
 
 
 def send_notification(kind, subject, body):
@@ -148,9 +196,22 @@ def dia_omitido(fecha):
   return False, None
 
 
+def nombre_base(tipo, ident):
+  """Base del nombre de archivo para este tipo/identificador.
+  El 'ident' es la fecha (modo dia a dia) o la etiqueta (modo snapshot); si esta
+  vacio se omite para no dejar un guion bajo colgante:
+    con ident  -> <PREFIX>_<TYPE>_<ident>
+    sin ident  -> <PREFIX>_<TYPE>
+  """
+  ident = "" if ident is None else str(ident).strip()
+  if ident:
+    return "%s_%s_%s" % (FILE_PREFIX, tipo, ident)
+  return "%s_%s" % (FILE_PREFIX, tipo)
+
+
 def checkpoint_path(tipo, fecha):
-  """Ruta del archivo de checkpoint para este tipo/fecha."""
-  return "%s/.checkpoint_%s_%s_%s" % (CHECKPOINT_DIR, FILE_PREFIX, tipo, fecha)
+  """Ruta del archivo de checkpoint para este tipo/identificador."""
+  return "%s/.checkpoint_%s" % (CHECKPOINT_DIR, nombre_base(tipo, fecha))
 
 
 def leer_checkpoint(tipo, fecha):
@@ -198,16 +259,18 @@ def extract_lines(input_file, output_file, start_line, end_line, part):
         outfile.write(lines[i])
 
 
-def EXPECT(TYPE, ARCHIVO):
+def EXPECT(nombre_parte):
   """Ejecuta el batch_script en el equipo remoto y valida que cada comando
-  se complete correctamente. Lanza una excepcion si falla la conexion o
-  si algun comando no completa/reporta error."""
+  se complete correctamente. 'nombre_parte' es el nombre base del archivo de la
+  parte (sin extension), p.ej. 'MTYSAJPSX01_PORTED_20260717_1' o
+  'MTYSAJPSX01_PORTED_1'. Lanza una excepcion si falla la conexion o si algun
+  comando no completa/reporta error."""
   try:
     cmd = pexpect.spawn(f'ssh -p {SSH_PORT} {SSH_USER}@{SSH_HOST}', timeout=2400)
   except Exception as e:
     raise ConnectionError("No se pudo iniciar la conexion ssh a %s:%s (%s)" % (SSH_HOST, SSH_PORT, e))
 
-  cmd.logfile = open("%s/%s_%s_%s.csv" % (LOG_DIR, FILE_PREFIX, str(TYPE), str(ARCHIVO)), "wb")
+  cmd.logfile = open("%s/%s.csv" % (LOG_DIR, nombre_parte), "wb")
   #cmd.logfile=sys.stdout.buffer
   cmd.setecho(False)
   cmd.delaybeforesend = 0.8
@@ -218,7 +281,7 @@ def EXPECT(TYPE, ARCHIVO):
   comandos = [
     CLI_PASSWORD,
     f'select target instance {CLI_INSTANCE}',
-    f'execute batch_script {FILE_PREFIX}_{TYPE}_{ARCHIVO}.csv',
+    f'execute batch_script {nombre_parte}.csv',
     'exit',
   ]
 
@@ -286,7 +349,8 @@ def accion_correctiva():
 def _intentar_parte_una_tanda(tipo, fecha, parte):
   """Intenta enviar+ejecutar la parte hasta SSH_RETRIES reintentos.
   Devuelve None si tuvo exito, o la ultima excepcion si agoto los reintentos."""
-  origen = f"{DIRFILES}/{FILE_PREFIX}_{tipo}_{fecha}_{parte}.csv"
+  nombre_parte = "%s_%s" % (nombre_base(tipo, fecha), parte)
+  origen = f"{DIRFILES}/{nombre_parte}.csv"
 
   # Validacion: la parte a enviar debe existir localmente antes del scp.
   if not os.path.isfile(origen):
@@ -308,7 +372,7 @@ def _intentar_parte_una_tanda(tipo, fecha, parte):
         )
 
       # Validacion de la ejecucion remota del batch_script
-      EXPECT(tipo, "%s_%s" % (str(fecha), parte))
+      EXPECT(nombre_parte)
       return None  # exito
     except Exception as e:
       ultima_exc = e
@@ -393,7 +457,8 @@ def procesar_dia(tipo, fecha, host):
   Propaga ServidorCaidoError si el equipo remoto agoto reintentos y ciclos de
   recuperacion: en ese caso el orquestador debe abortar el rango (no tiene
   sentido seguir intentando dias contra un servidor caido)."""
-  archivo = f"{DIRFILES}/{FILE_PREFIX}_{tipo}_{fecha}.csv"
+  base = nombre_base(tipo, fecha)
+  archivo = f"{DIRFILES}/{base}.csv"
 
   send_notification(
     "start",
@@ -430,7 +495,7 @@ def procesar_dia(tipo, fecha, host):
       num1 = part * CHUNK_SIZE
       extract_lines(
         archivo,
-        f"{DIRFILES}/{FILE_PREFIX}_{tipo}_{fecha}_{part}.csv",
+        f"{DIRFILES}/{base}_{part}.csv",
         num0, num1, part,
       )
 
@@ -520,113 +585,157 @@ def rango_de_fechas(desde, hasta):
     actual = actual + timedelta(days=1)
 
 
-# ---------------------------------------------------------------------------
-# Menu de utilizacion / argumentos
-# ---------------------------------------------------------------------------
-# Modos:
-#   --date YYYYMMDD                    -> procesa un solo dia (compatibilidad)
-#   --date-from YYYYMMDD --date-to ... -> procesa el rango, un dia a la vez
-parser = argparse.ArgumentParser(description='Portabilidad Process')
-parser.add_argument('--type', type=str, required=True, help='PORTED/DELETED')
-parser.add_argument('--date', type=str, help='Fecha unica a procesar (YYYYMMDD)')
-parser.add_argument('--date-from', dest='date_from', type=str,
-                    help='Inicio del rango de fechas a procesar (YYYYMMDD)')
-parser.add_argument('--date-to', dest='date_to', type=str,
-                    help='Fin del rango de fechas a procesar (YYYYMMDD), inclusive')
-
-args = parser.parse_args()
-
+# Patrones que se esperan del CLI remoto (prompt de password y prompt '> ').
+# Global de modulo: lo usa EXPECT().
 buscar = ['Password: ', '> ']
-host = socket.gethostname()
 
-# --- Determinar la lista de fechas a procesar segun el modo ---
-if args.date_from or args.date_to:
-  if not (args.date_from and args.date_to):
-    print("[ERROR] Para procesar un rango debes indicar --date-from y --date-to.",
-          file=sys.stderr)
-    sys.exit(2)
-  if args.date:
-    print("[ERROR] Usa --date (dia unico) o --date-from/--date-to (rango), no ambos.",
-          file=sys.stderr)
-    sys.exit(2)
 
-  d_from = parse_run_date(args.date_from)
-  d_to = parse_run_date(args.date_to)
-  if d_from is None or d_to is None:
-    print("[ERROR] Formato de fecha invalido en --date-from/--date-to "
-          "(usa YYYYMMDD o YYYY-MM-DD).", file=sys.stderr)
-    sys.exit(2)
-  if d_to < d_from:
-    print("[ERROR] --date-to (%s) es anterior a --date-from (%s)."
-          % (args.date_to, args.date_from), file=sys.stderr)
-    sys.exit(2)
+def resolver_fechas(date=None, date_from=None, date_to=None):
+  """Convierte los parametros de fecha en la lista de dias (YYYYMMDD) a procesar.
+  Acepta un dia unico (date) o un rango inclusivo (date_from/date_to), pero no
+  ambos. Lanza ValueError con un mensaje claro ante combinaciones invalidas."""
+  if date_from or date_to:
+    if not (date_from and date_to):
+      raise ValueError("Para procesar un rango debes indicar date_from y date_to.")
+    if date:
+      raise ValueError("Usa date (dia unico) o date_from/date_to (rango), no ambos.")
 
-  # Formato de fecha para el nombre de archivo: se conserva YYYYMMDD.
-  fechas = [d.strftime("%Y%m%d") for d in rango_de_fechas(d_from, d_to)]
-  print("[INFO] Modo RANGO: %d dia(s) de %s a %s."
-        % (len(fechas), args.date_from, args.date_to))
-elif args.date:
-  fechas = [args.date]
-else:
-  print("[ERROR] Debes indicar --date, o bien --date-from y --date-to.", file=sys.stderr)
-  sys.exit(2)
+    d_from = parse_run_date(date_from)
+    d_to = parse_run_date(date_to)
+    if d_from is None or d_to is None:
+      raise ValueError("Formato de fecha invalido en date_from/date_to "
+                       "(usa YYYYMMDD o YYYY-MM-DD).")
+    if d_to < d_from:
+      raise ValueError("date_to (%s) es anterior a date_from (%s)." % (date_to, date_from))
 
-# ---------------------------------------------------------------------------
-# Ejecucion (uno o varios dias). Un dia que falla no detiene los siguientes.
-# ---------------------------------------------------------------------------
-dias_ok = []
-dias_fallidos = []
-dias_omitidos = []
-dias_no_intentados = []
-servidor_caido = False
+    fechas = [d.strftime("%Y%m%d") for d in rango_de_fechas(d_from, d_to)]
+    print("[INFO] Modo RANGO: %d dia(s) de %s a %s." % (len(fechas), date_from, date_to))
+    return fechas
 
-for i, fecha in enumerate(fechas):
-  omitir, motivo = dia_a_omitir(fecha)
-  if omitir:
-    print("[OMITIDO] (%s) No se ejecuta: %s." % (fecha, motivo))
-    dias_omitidos.append((fecha, motivo))
-    continue
+  if date:
+    return [date]
+
+  raise ValueError("Debes indicar date, o bien date_from y date_to.")
+
+
+def _procesar_lista(tipo, ids, host, aplicar_calendario):
+  """Procesa una lista de 'ids' (fechas en modo dia a dia, o un unico label en
+  modo snapshot). Cada id se usa para nombrar los CSV/checkpoints. Un id que
+  falla por causa propia no detiene a los demas; un servidor caido tras la
+  recuperacion aborta los restantes. Devuelve el codigo de salida (0/1)."""
+  ok = []
+  fallidos = []
+  omitidos = []
+  no_intentados = []
+  servidor_caido = False
+
+  for i, ident in enumerate(ids):
+    # El calendario (domingos/festivos) solo aplica al proceso por fecha, no a
+    # un snapshot del full_sync (que no depende del dia de ejecucion).
+    if aplicar_calendario:
+      omitir, motivo = dia_a_omitir(ident)
+      if omitir:
+        print("[OMITIDO] (%s) No se ejecuta: %s." % (ident, motivo))
+        omitidos.append((ident, motivo))
+        continue
+
+    try:
+      if procesar_dia(tipo, ident, host):
+        ok.append(ident)
+      else:
+        # Fallo propio (ej. archivo inexistente): se continua con el resto.
+        fallidos.append(ident)
+    except ServidorCaidoError:
+      # El servidor sigue caido tras la recuperacion: no tiene sentido seguir
+      # intentando (y rebooteando) los restantes. Se aborta.
+      servidor_caido = True
+      fallidos.append(ident)
+      no_intentados = ids[i + 1:]
+      print("[ABORTAR] (%s) Servidor caido tras la recuperacion; se abortan los "
+            "%d restante(s)." % (ident, len(no_intentados)), file=sys.stderr)
+      if no_intentados:
+        send_notification(
+          "error",
+          "[Portabilidad] ABORTADO %s" % tipo,
+          "Se aborto porque el equipo remoto sigue caido tras la "
+          "accion correctiva.\n"
+          "Host: %s\nTipo: %s\nUltimo intentado: %s\n"
+          "No intentados (%d): %s\n"
+          "Reanuda cuando el equipo este disponible; los OK ya estan hechos y "
+          "los pendientes conservan su checkpoint.\n"
+          % (host, tipo, ident, len(no_intentados), ", ".join(no_intentados)),
+        )
+      break
+
+  print("[RESUMEN] OK: %d | Fallidos: %d | Omitidos: %d | No intentados: %d"
+        % (len(ok), len(fallidos), len(omitidos), len(no_intentados)))
+  if fallidos:
+    print("[RESUMEN] Fallidos: %s" % ", ".join(fallidos), file=sys.stderr)
+  if servidor_caido:
+    print("[RESUMEN] ABORTADO por servidor caido. No intentados: %s"
+          % ", ".join(no_intentados), file=sys.stderr)
+
+  return 1 if (fallidos or servidor_caido) else 0
+
+
+def run(tipo, date=None, date_from=None, date_to=None, label=None):
+  """Punto de entrada reutilizable (lo usan el CLI y full_sync.py). Ejecuta la
+  portabilidad de 'tipo' (PORTED/DELETED) en uno de dos modos:
+
+    - Modo FECHA (dia a dia): pasa date o date_from/date_to. Los CSV se llaman
+      <PREFIX>_<TYPE>_<fecha>.csv y se omiten domingos/festivos (calendario).
+    - Modo SNAPSHOT (full_sync): pasa label (o nada). El CSV se llama
+      <PREFIX>_<TYPE>[_<label>].csv y NO se aplica calendario (un snapshot del
+      estado total no depende del dia de ejecucion).
+
+  No se pueden mezclar los dos modos. Devuelve el codigo de salida (0 = OK;
+  1 = hubo fallos o se aborto). No llama a sys.exit(): el llamador decide."""
+  # Valida que toda la configuracion obligatoria provenga del .env antes de operar.
+  validar_configuracion()
+  host = socket.gethostname()
+
+  modo_fecha = bool(date or date_from or date_to)
+  if modo_fecha and label is not None:
+    raise ValueError("Usa el modo fecha (date/date-from/date-to) O el modo "
+                     "snapshot (label), no ambos.")
+
+  if modo_fecha:
+    ids = resolver_fechas(date=date, date_from=date_from, date_to=date_to)
+    return _procesar_lista(tipo, ids, host, aplicar_calendario=True)
+
+  # Modo snapshot: un unico "id" que es el label (o cadena vacia => <PREFIX>_<TYPE>.csv).
+  ident = (label or "").strip()
+  return _procesar_lista(tipo, [ident], host, aplicar_calendario=False)
+
+
+def main(argv=None):
+  """Punto de entrada del CLI. Dos modos, mutuamente excluyentes:
+    Dia a dia (portabilidad por fecha):
+      --date YYYYMMDD                      -> un solo dia
+      --date-from YYYYMMDD --date-to YYYYMMDD -> un rango, dia a dia
+    Snapshot (diferencias del full_sync, sin fecha):
+      --label ETIQUETA  (o sin argumento)  -> <PREFIX>_<TYPE>[_<label>].csv
+  """
+  parser = argparse.ArgumentParser(description='Portabilidad Process')
+  parser.add_argument('--type', type=str, required=True, help='PORTED/DELETED')
+  parser.add_argument('--date', type=str, help='Fecha unica a procesar (YYYYMMDD)')
+  parser.add_argument('--date-from', dest='date_from', type=str,
+                      help='Inicio del rango de fechas a procesar (YYYYMMDD)')
+  parser.add_argument('--date-to', dest='date_to', type=str,
+                      help='Fin del rango de fechas a procesar (YYYYMMDD), inclusive')
+  parser.add_argument('--label', type=str,
+                      help='Etiqueta opcional para el snapshot (sin fecha). '
+                           'Nombra el CSV como <PREFIX>_<TYPE>[_<label>].csv.')
+
+  args = parser.parse_args(argv)
 
   try:
-    if procesar_dia(args.type, fecha, host):
-      dias_ok.append(fecha)
-    else:
-      # Fallo propio del dia (ej. archivo inexistente): se continua con el resto.
-      dias_fallidos.append(fecha)
-  except ServidorCaidoError:
-    # El servidor sigue caido tras la recuperacion: no tiene sentido seguir
-    # intentando (y rebooteando) los dias restantes. Se aborta el rango.
-    servidor_caido = True
-    dias_fallidos.append(fecha)
-    dias_no_intentados = fechas[i + 1:]
-    print("[ABORTAR] (%s) Servidor caido tras la recuperacion; se abortan los "
-          "%d dia(s) restantes del rango." % (fecha, len(dias_no_intentados)),
-          file=sys.stderr)
-    if dias_no_intentados:
-      send_notification(
-        "error",
-        "[Portabilidad] RANGO ABORTADO %s" % args.type,
-        "El rango se aborto porque el equipo remoto sigue caido tras la "
-        "accion correctiva.\n"
-        "Host: %s\nTipo: %s\nUltimo dia intentado: %s\n"
-        "Dias no intentados (%d): %s\n"
-        "Reanuda el rango cuando el equipo este disponible; los dias OK ya "
-        "estan hechos y los pendientes conservan su checkpoint.\n"
-        % (host, args.type, fecha, len(dias_no_intentados),
-           ", ".join(dias_no_intentados)),
-      )
-    break
+    return run(args.type, date=args.date, date_from=args.date_from,
+               date_to=args.date_to, label=args.label)
+  except ValueError as e:
+    print("[ERROR] %s" % e, file=sys.stderr)
+    return 2
 
-# ---------------------------------------------------------------------------
-# Resumen final
-# ---------------------------------------------------------------------------
-print("[RESUMEN] OK: %d | Fallidos: %d | Omitidos: %d | No intentados: %d"
-      % (len(dias_ok), len(dias_fallidos), len(dias_omitidos), len(dias_no_intentados)))
-if dias_fallidos:
-  print("[RESUMEN] Dias fallidos: %s" % ", ".join(dias_fallidos), file=sys.stderr)
-if servidor_caido:
-  print("[RESUMEN] Rango ABORTADO por servidor caido. No intentados: %s"
-        % ", ".join(dias_no_intentados), file=sys.stderr)
 
-# Codigo de salida distinto de 0 si algun dia fallo o se aborto el rango.
-sys.exit(1 if (dias_fallidos or servidor_caido) else 0)
+if __name__ == "__main__":
+  sys.exit(main())
