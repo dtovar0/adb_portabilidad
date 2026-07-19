@@ -284,7 +284,7 @@ def descargar_abd():
         n += 1
         siguiente_log = _log_progreso("ABD", n, t0, siguiente_log)
 
-  print("[FULL_SYNC]   ABD: %s registro(s) | %s | %.1fs."
+  print("[FULL_SYNC] ABD LISTA: %s registro(s) descargado(s) | %s | %.1fs."
         % ("{:,}".format(n), peso_archivo(abd_path), time.monotonic() - t0))
 
 
@@ -319,7 +319,7 @@ def descargar_psx():
           fail += 1
         siguiente_log = _log_progreso("PSX", ok + fail, t0, siguiente_log)
 
-  print("[FULL_SYNC]   PSX: %s registro(s) OK, %s con formato invalido | %s | %.1fs."
+  print("[FULL_SYNC] PSX LISTA: %s registro(s) OK, %s con formato invalido | %s | %.1fs."
         % ("{:,}".format(ok), "{:,}".format(fail), peso_archivo(psx_path),
            time.monotonic() - t0))
 
@@ -366,11 +366,15 @@ def split_por_prefijo(base, prefijos):
   Aqui es donde se aplica realmente el loteo: la descarga trae todo, el split
   lo trocea para que comparar() cargue solo un lote a la vez."""
   ruta = os.path.join(SYNC_WORKDIR, f"{base}.csv")
+  t0 = time.monotonic()
+  print("[FULL_SYNC]   Troceando %s (%s, %s) en %d lote(s) ..."
+        % (base.upper(), ruta, peso_archivo(ruta), len(prefijos)))
   df = pd.read_csv(ruta, names=["number", "operator"], dtype={"number": str, "operator": str})
   for pref in prefijos:
     sub = df[df["number"].str.startswith(pref)]
     sub.to_csv(os.path.join(SYNC_WORKDIR, f"{base}_{pref}.csv"), header=False, index=False)
-  print("[FULL_SYNC]   %s dividido en %d lote(s)." % (base.upper(), len(prefijos)))
+  print("[FULL_SYNC]   %s: %s fila(s) dividida(s) en %d lote(s) | %.1fs."
+        % (base.upper(), "{:,}".format(len(df)), len(prefijos), time.monotonic() - t0))
   del df
 
 
@@ -427,7 +431,19 @@ def comparar(prefijos):
   total_add = 0
   total_del = 0
 
-  for pref in prefijos:
+  t0 = time.monotonic()
+  siguiente_log = t0 + SYNC_PROGRESS_SECS
+  total_lotes = len(prefijos)
+
+  for i, pref in enumerate(prefijos, 1):
+    # Progreso por tiempo: cuantos lotes llevamos comparados (no queda mudo con
+    # muchos lotes o lotes grandes que tardan minutos).
+    if SYNC_PROGRESS_SECS and time.monotonic() >= siguiente_log:
+      print("[FULL_SYNC]   Comparando lote %d/%d (%.0fs, %s alta(s)/%s baja(s) hasta ahora) ..."
+            % (i, total_lotes, time.monotonic() - t0,
+               "{:,}".format(total_add), "{:,}".format(total_del)))
+      siguiente_log = time.monotonic() + SYNC_PROGRESS_SECS
+
     df_psx = _leer_lote(os.path.join(SYNC_WORKDIR, f"psx_{pref}.csv"))
     df_abd = _leer_lote(os.path.join(SYNC_WORKDIR, f"abd_{pref}.csv"))
 
@@ -582,10 +598,18 @@ def main():
 
   # 2) Troceo por prefijo (si el loteo esta activo) y comparacion. comparar()
   #    carga solo un lote por lado a la vez (control de memoria).
+  print("[FULL_SYNC] === Iniciando TROCEO por prefijo (%d lote(s)) ===" % len(prefijos))
+  t_split = time.monotonic()
   split_por_prefijo("abd", prefijos)
   split_por_prefijo("psx", prefijos)
-  lineas_put, lineas_del = comparar(prefijos)
+  print("[FULL_SYNC] Troceo completado en %.1fs." % (time.monotonic() - t_split))
 
+  print("[FULL_SYNC] === Iniciando COMPARACION (ABD vs PSX) ===")
+  t_cmp = time.monotonic()
+  lineas_put, lineas_del = comparar(prefijos)
+  print("[FULL_SYNC] Comparacion completada en %.1fs." % (time.monotonic() - t_cmp))
+
+  print("[FULL_SYNC] === Escribiendo CSV de diferencias ===")
   escribir_salida("PORTED", label, lineas_put)
   escribir_salida("DELETED", label, lineas_del)
 
