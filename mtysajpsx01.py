@@ -45,6 +45,13 @@ MAIL_TO = [x.strip() for x in os.environ.get("MAIL_TO", "").split(",") if x.stri
 # ---------------------------------------------------------------------------
 # Configuracion de conexion
 # ---------------------------------------------------------------------------
+# Hay TRES conexiones independientes, cada una a su propio servidor:
+#   1) EMS_CLI : sesion pexpect que ejecuta los comandos put/delete (SSH_*/CLI_*)
+#   2) SCP     : copia de los archivos de comandos al servidor destino (SCP_*)
+#   3) RECOVERY: accion correctiva/reboot tras agotar reintentos (RECOVERY_SSH_*)
+# No comparten host/puerto/usuario: cada bloque define los suyos.
+
+# --- 1) EMS_CLI (sesion pexpect a la consola SONUS/EMS) ---
 SSH_HOST = os.environ.get("SSH_HOST", "")
 # Puerto de la SESION CLI del EMS (ssh interactivo a la consola SONUS/EMS). En
 # estos equipos suele ser un puerto propio de la CLI (p. ej. 8122), distinto del
@@ -54,6 +61,12 @@ SSH_USER = os.environ.get("SSH_USER", "")
 CLI_PASSWORD = os.environ.get("CLI_PASSWORD", "")
 CLI_INSTANCE = os.environ.get("CLI_INSTANCE", "")
 FILE_PREFIX = os.environ.get("FILE_PREFIX", "")
+
+# --- 2) SCP (copia de archivos; puede ir a OTRO servidor que la CLI) ---
+# Host destino del scp. Es una conexion aparte de la CLI, por eso tiene su propio
+# host. Si se deja vacio, cae a SSH_HOST (retrocompatible con el caso de un solo
+# servidor donde la CLI y el scp coinciden).
+SCP_HOST = os.environ.get("SCP_HOST", "").strip() or SSH_HOST
 SCP_USER = os.environ.get("SCP_USER", "")
 # Puerto del scp de los archivos. Es el SSH del SISTEMA OPERATIVO (por defecto 22),
 # NO el de la CLI: el scp copia archivos al filesystem del equipo, no entra a la
@@ -69,6 +82,15 @@ SCP_DEST_PATH = os.environ.get("SCP_DEST_PATH", "")
 # Se activa con CLI_DEBUG=true o, para reutilizar el mismo switch del full_sync,
 # con SYNC_DEBUG=true. Por defecto false (salida solo al archivo de log).
 CLI_DEBUG = env_bool("CLI_DEBUG", False) or env_bool("SYNC_DEBUG", False)
+
+# Lineas de ruido benigno del transporte ssh (no de la CLI) que contienen
+# palabras como 'failed' y provocarian un falso positivo en la deteccion de
+# errores de la salida de la CLI. Se comparan en minusculas contra cada linea.
+# El caso tipico es 'PTY allocation request failed on channel 0' del banner de
+# login cuando el equipo no asigna un pseudo-terminal (ya se evita con 'ssh -T').
+RUIDO_SSH_BENIGNO = (
+  "pty allocation request failed",
+)
 
 # ---------------------------------------------------------------------------
 # Rutas y parametros del proceso
@@ -282,7 +304,10 @@ def EXPECT(nombre_parte):
   parte (sin extension), p.ej. 'MTYSAJPSX01_PORTED_20260717_1' o
   'MTYSAJPSX01_PORTED_1'. Lanza una excepcion si falla la conexion o si algun
   comando no completa/reporta error."""
-  ssh_cmd = f'ssh -p {SSH_PORT} -o User={SSH_USER} {SSH_USER}@{SSH_HOST}'
+  # -T: no pedir pseudo-terminal (PTY). La CLI de Sonus no la necesita y, si el
+  # equipo no puede asignarla, emite 'PTY allocation request failed on channel 0',
+  # un warning benigno que ademas ensuciaba la deteccion de errores por 'failed'.
+  ssh_cmd = f'ssh -T -p {SSH_PORT} -o User={SSH_USER} {SSH_USER}@{SSH_HOST}'
   if CLI_DEBUG:
     print("[CLI_DEBUG] Abriendo sesion CLI: %s" % ssh_cmd)
   try:
@@ -318,21 +343,29 @@ def EXPECT(nombre_parte):
       raise ConnectionError("No se obtuvo el prompt inicial de %s (posible fallo de conexion)" % SSH_HOST)
 
     for c in comandos:
+      # El primer comando es el CLI_PASSWORD: nunca mostrarlo en claro, ni en el
+      # debug ni en los mensajes de error/excepcion.
+      c_mostrado = "<CLI_PASSWORD>" if c == CLI_PASSWORD else c
       if CLI_DEBUG:
-        # El primer comando es el CLI_PASSWORD: no lo imprimimos en claro.
-        mostrado = "<CLI_PASSWORD>" if c == CLI_PASSWORD else c
-        print("[CLI_DEBUG] >>> %s" % mostrado)
+        print("[CLI_DEBUG] >>> %s" % c_mostrado)
       cmd.sendline(c)
       idx = cmd.expect(buscar + [pexpect.EOF, pexpect.TIMEOUT])
       if idx >= len(buscar):
-        raise RuntimeError("El comando '%s' no completo (EOF/TIMEOUT)" % c)
+        raise RuntimeError("El comando '%s' no completo (EOF/TIMEOUT)" % c_mostrado)
 
       # Validacion de la salida: buscar patrones de error en lo recibido.
       salida = (cmd.before or b"")
       if isinstance(salida, bytes):
         salida = salida.decode(errors="ignore")
-      if any(err in salida.lower() for err in ("error", "failed", "invalid", "denied", "not found")):
-        raise RuntimeError("El comando '%s' reporto un error: %s" % (c, salida.strip()[-300:]))
+      # Se descartan lineas de ruido benigno del transporte ssh (no de la CLI)
+      # que contienen palabras como 'failed' y darian un falso positivo. El caso
+      # tipico: 'PTY allocation request failed on channel 0' del banner de login.
+      util = "\n".join(
+        ln for ln in salida.splitlines()
+        if not any(ruido in ln.lower() for ruido in RUIDO_SSH_BENIGNO)
+      )
+      if any(err in util.lower() for err in ("error", "failed", "invalid", "denied", "not found")):
+        raise RuntimeError("El comando '%s' reporto un error: %s" % (c_mostrado, salida.strip()[-300:]))
   finally:
     try:
       cmd.close()
@@ -388,7 +421,7 @@ def _intentar_parte_una_tanda(tipo, fecha, parte):
   if not os.path.isfile(origen):
     raise FileNotFoundError("No se encontro la parte a enviar por scp: %s" % origen)
 
-  destino = f"{SCP_USER}@{SSH_HOST}:{SCP_DEST_PATH}"
+  destino = f"{SCP_USER}@{SCP_HOST}:{SCP_DEST_PATH}"
   # '-o User=' fuerza el usuario del .env por encima de cualquier ~/.ssh/config
   # del que corra el proceso (p. ej. airflow), para que el scp NUNCA se conecte
   # como otro usuario (root) aunque el config del host diga lo contrario.
@@ -502,8 +535,8 @@ def procesar_dia(tipo, fecha, host):
     "start",
     "[Portabilidad] INICIO %s %s" % (tipo, fecha),
     "El proceso de portabilidad %s ha iniciado.\n"
-    "Host: %s\nTipo: %s\nFecha: %s\nArchivo: %s\nDestino: %s@%s\n"
-    % (FILE_PREFIX, host, tipo, fecha, archivo, SCP_USER, SSH_HOST),
+    "Host: %s\nTipo: %s\nFecha: %s\nArchivo: %s\nDestino scp: %s@%s\n"
+    % (FILE_PREFIX, host, tipo, fecha, archivo, SCP_USER, SCP_HOST),
   )
 
   comandos_ok = 0
