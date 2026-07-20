@@ -41,7 +41,6 @@ try:
 except ImportError:
   pass
 
-import pandas as pd
 import sqlalchemy as sal
 import urllib.parse
 
@@ -364,18 +363,52 @@ def split_por_prefijo(base, prefijos):
   El prefijo es un string (ej. '2' o '20' o '200') segun SYNC_DEPTH. Ambas bases
   usan el mismo conjunto de prefijos para que los lotes casen al comparar.
   Aqui es donde se aplica realmente el loteo: la descarga trae todo, el split
-  lo trocea para que comparar() cargue solo un lote a la vez."""
+  lo trocea para que comparar() cargue solo un lote a la vez.
+
+  Se hace por STREAMING (linea por linea, sin pandas): lee el CSV completo fila a
+  fila y reparte cada linea al archivo del lote que le toca segun su prefijo. El
+  <base>.csv puede pesar varios GB (decenas de millones de filas); cargarlo entero
+  con pd.read_csv reventaba la RAM (OOM/Killed). Asi el pico de memoria es una sola
+  linea mas los file handles de los lotes.
+
+  Los prefijos anidan por longitud (todos los de depth D tienen el mismo largo D),
+  asi que el lote correcto de cada numero es el prefijo formado por sus primeros
+  len(prefijo) digitos: un lookup O(1) en un dict, sin recorrer todos los prefijos.
+  Con loteo deshabilitado el unico prefijo es "" (largo 0) y todo cae en ese lote."""
   ruta = os.path.join(SYNC_WORKDIR, f"{base}.csv")
   t0 = time.monotonic()
   print("[FULL_SYNC]   Troceando %s (%s, %s) en %d lote(s) ..."
         % (base.upper(), ruta, peso_archivo(ruta), len(prefijos)))
-  df = pd.read_csv(ruta, names=["number", "operator"], dtype={"number": str, "operator": str})
-  for pref in prefijos:
-    sub = df[df["number"].str.startswith(pref)]
-    sub.to_csv(os.path.join(SYNC_WORKDIR, f"{base}_{pref}.csv"), header=False, index=False)
-  print("[FULL_SYNC]   %s: %s fila(s) dividida(s) en %d lote(s) | %.1fs."
-        % (base.upper(), "{:,}".format(len(df)), len(prefijos), time.monotonic() - t0))
-  del df
+
+  # Un handle de escritura por lote, abiertos una sola vez (con depth 2 son 80).
+  # Indexados por prefijo para repartir cada linea con un lookup directo.
+  handles = {pref: open(os.path.join(SYNC_WORKDIR, f"{base}_{pref}.csv"), "w")
+             for pref in prefijos}
+  # Todos los prefijos del nivel tienen el mismo largo; lo usamos para recortar el
+  # numero y ubicar su lote. (Con loteo deshabilitado largo=0 -> prefijo "".)
+  largo_pref = len(prefijos[0]) if prefijos else 0
+  n = 0
+  descartadas = 0
+  try:
+    with open(ruta, "r") as f:
+      for linea in f:
+        # El numero es lo que va antes de la primera coma (evita partir el resto).
+        coma = linea.find(",")
+        numero = linea[:coma] if coma != -1 else linea.rstrip("\n")
+        destino = handles.get(numero[:largo_pref])
+        if destino is None:
+          # Numero cuyo prefijo no cae en ningun lote (p. ej. digito fuera de 2..9).
+          descartadas += 1
+          continue
+        destino.write(linea)
+        n += 1
+  finally:
+    for h in handles.values():
+      h.close()
+
+  extra = (" (%s fila(s) sin lote/descartada(s))" % "{:,}".format(descartadas)) if descartadas else ""
+  print("[FULL_SYNC]   %s: %s fila(s) dividida(s) en %d lote(s)%s | %.1fs."
+        % (base.upper(), "{:,}".format(n), len(prefijos), extra, time.monotonic() - t0))
 
 
 # ---------------------------------------------------------------------------
@@ -405,16 +438,26 @@ def comando_delete(num):
 
 
 def _leer_lote(ruta):
-  """Lee un CSV de lote (num, operator). Devuelve un DataFrame vacio (con las
-  columnas esperadas) si el archivo no existe o esta vacio. Con loteo profundo
-  (depth 2/3) muchos lotes no tienen datos, asi que esto es lo normal."""
-  cols = ["num", "operator"]
+  """Lee un CSV de lote (num,operator) a un dict {num: linea_cruda}. Devuelve un
+  dict vacio si el archivo no existe o esta vacio (comun con loteo profundo, donde
+  muchos prefijos no tienen datos). La clave es SOLO el numero (identidad de la
+  fila); el valor es la linea cruda 'num,operator', que ya trae el operator para
+  comparar la tupla completa y generar el comando sin re-parsear campos.
+
+  Se usa un dict en vez de pandas: solo carga en memoria el lote en curso (acotado
+  por SYNC_DEPTH), sin el overhead de un DataFrame ni el costoso df.apply(tuple)."""
+  filas = {}
   if not os.path.isfile(ruta) or os.path.getsize(ruta) == 0:
-    return pd.DataFrame(columns=cols, dtype=str)
-  try:
-    return pd.read_csv(ruta, names=cols, dtype=str)
-  except pd.errors.EmptyDataError:
-    return pd.DataFrame(columns=cols, dtype=str)
+    return filas
+  with open(ruta, "r") as f:
+    for linea in f:
+      linea = linea.rstrip("\n")
+      if not linea:
+        continue
+      coma = linea.find(",")
+      num = linea[:coma] if coma != -1 else linea
+      filas[num] = linea
+  return filas
 
 
 def comparar(prefijos):
@@ -422,9 +465,15 @@ def comparar(prefijos):
   Solo se cargan en memoria los dos lotes del prefijo en curso, no las bases
   completas: por eso un loteo mas profundo (SYNC_DEPTH) reduce el pico de RAM.
 
+  La comparacion es por conjuntos (dict), no con pandas: para cada lote se buscan
+  las filas que difieren en la TUPLA completa (numero + operator). Un numero que
+  esta en ambos lados pero con distinto operator cuenta como baja (en PSX con el
+  operator viejo) y alta (en ABD con el nuevo), que es justo lo que reconcilia el
+  equipo.
+
   Referencia: el PSX es el estado actual del equipo.
-    - En ABD y no en PSX -> alta   (put)     -> PORTED
-    - En PSX y no en ABD -> baja   (delete)  -> DELETED
+    - Tupla en ABD y no en PSX -> alta   (put)     -> PORTED
+    - Tupla en PSX y no en ABD -> baja   (delete)  -> DELETED
   """
   lineas_put = []
   lineas_del = []
@@ -444,30 +493,36 @@ def comparar(prefijos):
                "{:,}".format(total_add), "{:,}".format(total_del)))
       siguiente_log = time.monotonic() + SYNC_PROGRESS_SECS
 
-    df_psx = _leer_lote(os.path.join(SYNC_WORKDIR, f"psx_{pref}.csv"))
-    df_abd = _leer_lote(os.path.join(SYNC_WORKDIR, f"abd_{pref}.csv"))
+    psx = _leer_lote(os.path.join(SYNC_WORKDIR, f"psx_{pref}.csv"))
+    abd = _leer_lote(os.path.join(SYNC_WORKDIR, f"abd_{pref}.csv"))
 
     # Lotes vacios en ambos lados: nada que comparar (comun con depth 2/3).
-    if df_psx.empty and df_abd.empty:
-      del df_psx, df_abd
+    if not psx and not abd:
       continue
 
-    # Altas: filas de ABD que no estan en PSX (comparando la tupla completa).
-    solo_abd = df_abd[~df_abd.apply(tuple, 1).isin(df_psx.apply(tuple, 1))]
-    for row in solo_abd.itertuples(index=False, name="R"):
-      lineas_put.append(comando_put(row.num, row.operator))
-    total_add += len(solo_abd)
+    n_add = 0
+    n_del = 0
 
-    # Bajas: filas de PSX que no estan en ABD.
-    solo_psx = df_psx[~df_psx.apply(tuple, 1).isin(df_abd.apply(tuple, 1))]
-    for row in solo_psx.itertuples(index=False, name="R"):
-      lineas_del.append(comando_delete(row.num))
-    total_del += len(solo_psx)
+    # Altas: filas de ABD cuya tupla (num,operator) no esta identica en PSX. Basta
+    # comparar la linea cruda, que codifica la tupla completa 'num,operator'.
+    for num, linea in abd.items():
+      if psx.get(num) != linea:
+        coma = linea.find(",")
+        operator = linea[coma + 1:] if coma != -1 else ""
+        lineas_put.append(comando_put(num, operator))
+        n_add += 1
 
-    if len(solo_abd) or len(solo_psx):
+    # Bajas: filas de PSX cuya tupla no esta identica en ABD.
+    for num, linea in psx.items():
+      if abd.get(num) != linea:
+        lineas_del.append(comando_delete(num))
+        n_del += 1
+
+    total_add += n_add
+    total_del += n_del
+    if n_add or n_del:
       print("[FULL_SYNC]   prefijo %s: %d alta(s), %d baja(s)."
-            % (pref, len(solo_abd), len(solo_psx)))
-    del df_psx, df_abd, solo_abd, solo_psx
+            % (pref, n_add, n_del))
 
   print("[FULL_SYNC] Diferencias totales: %d alta(s) (PORTED), %d baja(s) (DELETED)."
         % (total_add, total_del))
