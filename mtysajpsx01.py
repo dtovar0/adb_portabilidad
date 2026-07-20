@@ -658,9 +658,19 @@ def rango_de_fechas(desde, hasta):
     actual = actual + timedelta(days=1)
 
 
-# Patrones que se esperan del CLI remoto (prompt de password y prompt '> ').
+# Patrones (REGEX) que se esperan del CLI remoto: prompt de password y prompt del
+# shell CLI. pexpect.expect() interpreta estos strings como expresiones regulares.
+#
+# El prompt real del equipo es de la forma 'PSX:V12.02.07R000:mtysajpsx01>' y
+# termina en '>' SIN un espacio garantizado detras. El patron viejo '> ' (mayor
+# que + espacio) no casaba ese prompt, asi que pexpect nunca detectaba el regreso
+# al prompt y la sesion se colgaba hasta el timeout.
+#
+# El patron nuevo casa un '>' seguido de espacios opcionales (incluido salto de
+# linea o fin de buffer). Se evita anclar con '$' porque pexpect recibe la salida
+# en fragmentos y '$' podria casar prematuramente.
 # Global de modulo: lo usa EXPECT().
-buscar = ['Password: ', '> ']
+buscar = ['Password:\\s*', '>\\s*']
 
 
 def resolver_fechas(date=None, date_from=None, date_to=None):
