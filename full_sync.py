@@ -659,9 +659,8 @@ def escribir_salida(tipo, label, lineas):
   """Escribe el CSV consolidado que ejecutara mtysajpsx01.py.
   El nombre se construye con mtysajpsx01.nombre_base para que coincida
   exactamente con lo que el ejecutor buscara: <PREFIX>_<TYPE>[_<label>].csv.
-  El header '?EMS::CLI?' NO se agrega aqui: mtysajpsx01.extract_lines lo antepone
-  automaticamente a las partes 2..N. La parte 1 (sin header) es la convencion
-  actual del pipeline."""
+  El archivo contiene solo los comandos put/delete, sin ningun header: se ejecuta
+  con 'execute batch_script' y el equipo espera exclusivamente comandos."""
   destino = os.path.join(DIRFILES, "%s.csv" % mtysajpsx01.nombre_base(tipo, label))
   with open(destino, "w") as f:
     f.writelines(lineas)

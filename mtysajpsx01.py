@@ -1,4 +1,5 @@
 import pexpect, argparse, sys, os
+import re
 import time
 import smtplib
 import socket
@@ -290,11 +291,11 @@ def extract_lines(input_file, output_file, start_line, end_line):
     lines = infile.readlines()
 
   with open(output_file, 'w') as outfile:
-    # TODAS las partes del loteo deben empezar con el header ?EMS::CLI? (incluida
-    # la parte 1): el equipo EMS lo exige para reconocer el archivo como un
-    # batch_script CLI. Antes se omitia en la parte 1, que el equipo rechazaba.
-    outfile.write("?EMS::CLI?\n")
-
+    # NO se antepone el header '?EMS::CLI?': el archivo se ejecuta con
+    # 'execute batch_script <archivo>' y el equipo lo lee del filesystem esperando
+    # solo comandos put/delete. El header no es un comando valido y hacia que el
+    # equipo se colgara tras el primer comando. (Sin header las partes procesan
+    # todos los comandos, como funcionaba antes.)
     for i in range(start_line, end_line):
       if 0 <= i < len(lines):
         outfile.write(lines[i])
@@ -326,7 +327,11 @@ def EXPECT(nombre_parte):
   if CLI_DEBUG:
     cmd.logfile_read = sys.stdout.buffer
   cmd.setecho(False)
-  cmd.delaybeforesend = 0.8
+  # delaybeforesend: pexpect espera este tiempo ANTES de cada sendline. Con 0.8s
+  # sumaba una pausa notoria por comando (password/select/execute/exit). Se pone a
+  # 0 (sin espera): el flujo es send -> expect(prompt), que ya sincroniza con el
+  # equipo, asi que la pausa fija no aporta y solo ralentizaba.
+  cmd.delaybeforesend = 0
   cmd.delayafterclose = 0.5
   cmd.delayafterterminate = 0.5
 
@@ -669,15 +674,15 @@ def rango_de_fechas(desde, hasta):
 # shell CLI. pexpect.expect() interpreta estos strings como expresiones regulares.
 #
 # El prompt real del equipo es de la forma 'PSX:V12.02.07R000:mtysajpsx01>' y
-# termina en '>' SIN un espacio garantizado detras. El patron viejo '> ' (mayor
-# que + espacio) no casaba ese prompt, asi que pexpect nunca detectaba el regreso
-# al prompt y la sesion se colgaba hasta el timeout.
-#
-# El patron nuevo casa un '>' seguido de espacios opcionales (incluido salto de
-# linea o fin de buffer). Se evita anclar con '$' porque pexpect recibe la salida
-# en fragmentos y '$' podria casar prematuramente.
-# Global de modulo: lo usa EXPECT().
-buscar = ['Password:\\s*', '>\\s*']
+# termina en el nombre de la instancia + '>'. Se ancla el patron a ese prompt
+# concreto ('<instancia>>') en vez de un '>' generico: un '>' suelto casaria
+# demasiado pronto (p. ej. el prompt que ya quedo en el buffer del comando
+# anterior), haciendo que el codigo mande el siguiente comando antes de que el
+# batch_script termine. Anclar al prompt de la instancia garantiza que solo se
+# avanza cuando el equipo realmente volvio a pedir input.
+# Global de modulo: lo usa EXPECT(); PROMPT_CLI se arma con CLI_INSTANCE.
+PROMPT_CLI = re.escape(CLI_INSTANCE) + ">"
+buscar = ['Password:\\s*', PROMPT_CLI]
 
 
 def resolver_fechas(date=None, date_from=None, date_to=None):
