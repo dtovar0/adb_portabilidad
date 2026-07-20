@@ -150,8 +150,14 @@ SYNC_BATCH_ENABLED = env_bool("SYNC_BATCH_ENABLED", True)
 # (abd.csv / psx.csv en el workdir). Util para re-comparar sin volver a bajar
 # decenas de millones de filas. Requiere que esa corrida previa haya dejado el
 # intermedio (SYNC_KEEP_INTERMEDIATE=true); si el CSV no existe, se aborta.
-SKIP_ABD = env_bool("SKIP_ABD", False)
-SKIP_PSX = env_bool("SKIP_PSX", False)
+#
+# SKIP_DB_DOWNLOAD es el atajo para saltar AMBAS descargas de una sola vez (equivale
+# a SKIP_ABD=true y SKIP_PSX=true), para re-comparar sin poner las dos flags. Los
+# flags por BD siguen valiendo: si SKIP_DB_DOWNLOAD=true, cada BD se salta salvo que
+# ya este cubierta por su propio SKIP_*, asi que basta con esta variable.
+SKIP_DB_DOWNLOAD = env_bool("SKIP_DB_DOWNLOAD", False)
+SKIP_ABD = SKIP_DB_DOWNLOAD or env_bool("SKIP_ABD", False)
+SKIP_PSX = SKIP_DB_DOWNLOAD or env_bool("SKIP_PSX", False)
 
 
 # ---------------------------------------------------------------------------
