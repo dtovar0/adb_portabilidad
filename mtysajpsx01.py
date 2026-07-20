@@ -285,13 +285,15 @@ def borrar_checkpoint(tipo, fecha):
     pass
 
 
-def extract_lines(input_file, output_file, start_line, end_line, part):
+def extract_lines(input_file, output_file, start_line, end_line):
   with open(input_file, 'r') as infile:
     lines = infile.readlines()
 
   with open(output_file, 'w') as outfile:
-    if (part != 1):
-      outfile.write("?EMS::CLI?\n")
+    # TODAS las partes del loteo deben empezar con el header ?EMS::CLI? (incluida
+    # la parte 1): el equipo EMS lo exige para reconocer el archivo como un
+    # batch_script CLI. Antes se omitia en la parte 1, que el equipo rechazaba.
+    outfile.write("?EMS::CLI?\n")
 
     for i in range(start_line, end_line):
       if 0 <= i < len(lines):
@@ -567,7 +569,7 @@ def procesar_dia(tipo, fecha, host):
       extract_lines(
         archivo,
         f"{DIRFILES}/{base}_{part}.csv",
-        num0, num1, part,
+        num0, num1,
       )
 
     print("[INFO] (%s) Archivo de %d linea(s); se generaron %d parte(s)."
