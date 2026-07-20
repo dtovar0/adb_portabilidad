@@ -73,6 +73,14 @@ FILE_PREFIX = os.environ.get("FILE_PREFIX", "")
 DIRFILES = os.environ.get("DIRFILES", "")
 SYNC_WORKDIR = os.environ.get("SYNC_WORKDIR", "").strip() or DIRFILES
 
+# Usuario del sistema con el que DEBE correr el proceso (p. ej. airflow). El
+# full_sync no cambia de usuario: el cambio lo hace quien lo invoca (Airflow con
+# run_as_user, o 'sudo -u <RUN_AS_USER>'). Este script solo VERIFICA que este
+# corriendo como ese usuario y aborta si no coincide, para no ejecutar por error
+# como root u otro usuario. Vacio => sin verificacion (corre como el usuario
+# actual, sea cual sea).
+RUN_AS_USER = os.environ.get("RUN_AS_USER", "").strip()
+
 # ---------------------------------------------------------------------------
 # Constantes del protocolo CLI del equipo (externalizadas al .env).
 # Son valores del formato de los comandos put/delete del equipo SONUS/EMS.
@@ -103,6 +111,58 @@ SYNC_DEPTH = int(os.environ.get("SYNC_DEPTH", "1"))
 # de registros mantiene un ritmo de log constante. 0 => sin lineas de progreso,
 # solo el resumen final.
 SYNC_PROGRESS_SECS = float(os.environ.get("SYNC_PROGRESS_SECS", "10"))
+
+
+def _env_bool_raw(name, default=False):
+  """Igual que env_bool pero disponible antes de definir env_bool (orden de modulo)."""
+  return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "si", "y")
+
+
+# Modo debug: imprime como se conecta a cada BD (usuario, host, puerto, driver,
+# DSN) para diagnosticar problemas de conexion/credenciales SIN volcar los
+# passwords en claro (se enmascaran por defecto). Actualo con SYNC_DEBUG=true.
+SYNC_DEBUG = _env_bool_raw("SYNC_DEBUG", False)
+# Peligroso: si ademas se pone SYNC_DEBUG_SHOW_SECRETS=true, el debug imprime los
+# passwords EN CLARO. Solo para diagnostico puntual; recuerda que los logs de
+# Airflow/consola quedan persistidos. Por defecto false (passwords enmascarados).
+SYNC_DEBUG_SHOW_SECRETS = _env_bool_raw("SYNC_DEBUG_SHOW_SECRETS", False)
+
+
+def _mask(secreto):
+  """Enmascara un secreto para el log: muestra que existe y su longitud, no el
+  valor. Con SYNC_DEBUG_SHOW_SECRETS=true lo devuelve en claro (bajo tu riesgo)."""
+  if secreto is None or secreto == "":
+    return "(vacio)"
+  if SYNC_DEBUG_SHOW_SECRETS:
+    return secreto
+  return "*** (%d chars)" % len(secreto)
+
+
+def debug_conexiones():
+  """Imprime el detalle de conexion de ambas BD y del usuario del proceso, para
+  diagnosticar problemas de credenciales/conexion. No conecta a nada: solo
+  reporta que valores se USARIAN. Los passwords van enmascarados salvo que
+  SYNC_DEBUG_SHOW_SECRETS=true."""
+  print("[DEBUG] ===== Configuracion de conexion (SYNC_DEBUG) =====")
+  print("[DEBUG] Proceso corre como usuario del sistema: '%s' (RUN_AS_USER=%s)"
+        % (usuario_actual(), RUN_AS_USER or "(sin verificar)"))
+  print("[DEBUG] --- BD ABD (Sistemas / MSSQL, via pyodbc) ---")
+  print("[DEBUG]   DRIVER   = %s" % ABD_DRIVER)
+  print("[DEBUG]   SERVER   = %s" % ABD_SERVER)
+  print("[DEBUG]   DATABASE = %s" % ABD_DATABASE)
+  print("[DEBUG]   UID      = %s" % (ABD_USER or "(vacio)"))
+  print("[DEBUG]   PWD      = %s" % _mask(ABD_PASSWORD))
+  print("[DEBUG]   Encrypt  = %s" % ABD_ENCRYPT)
+  print("[DEBUG] --- BD PSX (equipo / Oracle, via oracledb/cx_Oracle) ---")
+  print("[DEBUG]   HOST     = %s" % PSX_HOST)
+  print("[DEBUG]   PORT     = %s" % PSX_PORT)
+  print("[DEBUG]   SID      = %s" % PSX_SID)
+  print("[DEBUG]   USER     = %s" % (PSX_USER or "(vacio)"))
+  print("[DEBUG]   PASSWORD = %s" % _mask(PSX_PASSWORD))
+  if not SYNC_DEBUG_SHOW_SECRETS:
+    print("[DEBUG] (passwords enmascarados; usa SYNC_DEBUG_SHOW_SECRETS=true "
+          "para verlos en claro, bajo tu riesgo)")
+  print("[DEBUG] ===================================================")
 
 
 def formatear_peso(num_bytes):
@@ -172,6 +232,39 @@ if SKIP_COMPARE:
 
 
 # ---------------------------------------------------------------------------
+# Verificacion del usuario del sistema (run_as)
+# ---------------------------------------------------------------------------
+def usuario_actual():
+  """Nombre del usuario del sistema con el que corre este proceso.
+  Usa el UID efectivo (getpwuid), no variables de entorno como USER/LOGNAME, que
+  pueden quedar 'pegadas' del login original tras un 'sudo -u' y mentir sobre
+  quien corre realmente. Cae a esas variables solo si no hay modulo pwd (Windows)."""
+  try:
+    import pwd
+    return pwd.getpwuid(os.geteuid()).pw_name
+  except Exception:
+    return os.environ.get("USER") or os.environ.get("LOGNAME") or "?"
+
+
+def verificar_usuario():
+  """Aborta si RUN_AS_USER esta definido y el proceso NO corre como ese usuario.
+  El full_sync no cambia de usuario (eso lo hace quien lo invoca: Airflow con
+  run_as_user o 'sudo -u'); aqui solo se comprueba, para no ejecutar por error
+  como root u otro usuario. Con RUN_AS_USER vacio no se verifica nada."""
+  if not RUN_AS_USER:
+    return
+  actual = usuario_actual()
+  if actual != RUN_AS_USER:
+    print("[ERROR] RUN_AS_USER=%s pero el proceso corre como '%s'.\n"
+          "        Ejecuta el full_sync como ese usuario (p. ej. "
+          "'sudo -u %s -E python3 full_sync.py ...' o el run_as_user de Airflow), "
+          "o ajusta/borra RUN_AS_USER en el .env."
+          % (RUN_AS_USER, actual, RUN_AS_USER), file=sys.stderr)
+    sys.exit(2)
+  print("[FULL_SYNC] Corriendo como usuario '%s' (RUN_AS_USER)." % actual)
+
+
+# ---------------------------------------------------------------------------
 # Validacion de configuracion obligatoria
 # ---------------------------------------------------------------------------
 def validar_configuracion():
@@ -214,6 +307,13 @@ def validar_configuracion():
 # ---------------------------------------------------------------------------
 def engine_abd():
   """Crea el engine SQLAlchemy hacia la BD de Sistemas (MSSQL) via pyodbc."""
+  if SYNC_DEBUG:
+    # Cadena ODBC tal cual se enviaria, con el PWD enmascarado (o en claro si
+    # SYNC_DEBUG_SHOW_SECRETS=true). Sirve para ver driver/servidor/uid reales.
+    print("[DEBUG] ABD odbc_connect = "
+          "DRIVER={%s};SERVER=%s;DATABASE=%s;UID=%s;PWD=%s;Encrypt=%s"
+          % (ABD_DRIVER, ABD_SERVER, ABD_DATABASE, ABD_USER,
+             _mask(ABD_PASSWORD), ABD_ENCRYPT))
   params = urllib.parse.quote_plus(
     "DRIVER={%s};"
     "SERVER=%s;"
@@ -237,10 +337,19 @@ def engine_psx():
     import oracledb
     dialecto = "oracle+oracledb"
     dsn = oracledb.makedsn(PSX_HOST, PSX_PORT, sid=PSX_SID)
+    driver_usado = "python-oracledb"
   except ImportError:
     import cx_Oracle
     dialecto = "oracle+cx_oracle"
     dsn = cx_Oracle.makedsn(PSX_HOST, PSX_PORT, sid=PSX_SID)
+    driver_usado = "cx_Oracle"
+
+  if SYNC_DEBUG:
+    # Connection string real con el password enmascarado (o en claro si
+    # SYNC_DEBUG_SHOW_SECRETS=true). Muestra el driver Oracle efectivamente usado.
+    print("[DEBUG] PSX driver = %s | dialecto = %s" % (driver_usado, dialecto))
+    print("[DEBUG] PSX conn = %s://%s:%s@%s"
+          % (dialecto, urllib.parse.quote_plus(PSX_USER), _mask(PSX_PASSWORD), dsn))
 
   cstr = "{dialecto}://{user}:{password}@{dsn}".format(
     dialecto=dialecto,
@@ -599,6 +708,15 @@ def main():
   args = parser.parse_args()
 
   label = (args.label or "").strip()
+
+  # Antes que nada: si RUN_AS_USER esta definido, verificar que el proceso corra
+  # como ese usuario (p. ej. airflow) y abortar si no. No cambia de usuario.
+  verificar_usuario()
+
+  # Modo debug: reporta como se conectara a cada BD (usuario/host/driver/DSN) con
+  # los passwords enmascarados. Util para diagnosticar credenciales/conexion.
+  if SYNC_DEBUG:
+    debug_conexiones()
 
   # --- Modo check: valida que el slave (PSX) tenga los mismos registros que el
   #     master (ABD). Solo cuenta (rapido), no descarga ni compara ni ejecuta.
