@@ -159,6 +159,17 @@ SKIP_DB_DOWNLOAD = env_bool("SKIP_DB_DOWNLOAD", False)
 SKIP_ABD = SKIP_DB_DOWNLOAD or env_bool("SKIP_ABD", False)
 SKIP_PSX = SKIP_DB_DOWNLOAD or env_bool("SKIP_PSX", False)
 
+# Saltar toda la fase de generacion (descarga + troceo + comparacion + escritura
+# de CSV) y arrancar DIRECTO en la ejecucion de la portabilidad contra el equipo,
+# REUSANDO los CSV PORTED/DELETED que dejo una corrida anterior en DIRFILES. Util
+# para reintentar solo la ejecucion sin volver a comparar. Si esos CSV no existen,
+# se aborta. Implica no bajar ni comparar las BD, asi que SKIP_COMPARE fuerza los
+# SKIP_* de descarga (no tiene sentido bajar lo que no se va a comparar).
+SKIP_COMPARE = env_bool("SKIP_COMPARE", False)
+if SKIP_COMPARE:
+  SKIP_ABD = True
+  SKIP_PSX = True
+
 
 # ---------------------------------------------------------------------------
 # Validacion de configuracion obligatoria
@@ -631,50 +642,68 @@ def main():
     prefijos = [""]
     print("[FULL_SYNC] Loteo DESHABILITADO: comparacion en una sola pasada.")
 
-  # 1) Descarga de cada base (o reuso del CSV previo si SKIP_ABD/SKIP_PSX).
-  #    Al saltar una descarga se REUSA el intermedio de una corrida anterior
-  #    (requiere SYNC_KEEP_INTERMEDIATE=true en aquella). Si el CSV no existe,
-  #    se aborta: comparar con una base ausente generaria diffs incorrectos
-  #    (en un full sync eso implica altas/bajas indebidas).
-  def _reusar_o_error(base):
-    ruta = os.path.join(SYNC_WORKDIR, "%s.csv" % base)
-    if not os.path.isfile(ruta):
-      print("[ERROR] SKIP_%s=true pero no existe el CSV a reusar: %s\n"
-            "        Genera uno con una corrida previa que use "
-            "SYNC_KEEP_INTERMEDIATE=true, o desactiva SKIP_%s."
-            % (base.upper(), ruta, base.upper()), file=sys.stderr)
-      sys.exit(2)
-    print("[FULL_SYNC] SKIP_%s=true: se reusa %s (%s)."
-          % (base.upper(), ruta, peso_archivo(ruta)))
-
-  if SKIP_ABD:
-    _reusar_o_error("abd")
+  # SKIP_COMPARE arranca directo en la ejecucion: se omiten descarga, troceo,
+  # comparacion y escritura, reusando los CSV PORTED/DELETED de una corrida previa.
+  # No tiene sentido junto a --no-execute (no quedaria nada por hacer).
+  if SKIP_COMPARE:
+    if args.no_execute:
+      print("[ERROR] SKIP_COMPARE=true con --no-execute no hace nada: se salta "
+            "la generacion y tampoco se ejecuta. Usa uno u otro.", file=sys.stderr)
+      return 2
+    for tipo in ("PORTED", "DELETED"):
+      csv = os.path.join(DIRFILES, "%s.csv" % mtysajpsx01.nombre_base(tipo, label))
+      if not os.path.isfile(csv):
+        print("[ERROR] SKIP_COMPARE=true pero no existe el CSV a ejecutar: %s\n"
+              "        Genera las diferencias con una corrida previa (sin "
+              "SKIP_COMPARE), o desactiva SKIP_COMPARE." % csv, file=sys.stderr)
+        return 2
+    print("[FULL_SYNC] SKIP_COMPARE=true: se omite descarga/troceo/comparacion; "
+          "se reusan los CSV PORTED/DELETED existentes y se ejecuta directo.")
   else:
-    descargar_abd()
+    # 1) Descarga de cada base (o reuso del CSV previo si SKIP_ABD/SKIP_PSX).
+    #    Al saltar una descarga se REUSA el intermedio de una corrida anterior
+    #    (requiere SYNC_KEEP_INTERMEDIATE=true en aquella). Si el CSV no existe,
+    #    se aborta: comparar con una base ausente generaria diffs incorrectos
+    #    (en un full sync eso implica altas/bajas indebidas).
+    def _reusar_o_error(base):
+      ruta = os.path.join(SYNC_WORKDIR, "%s.csv" % base)
+      if not os.path.isfile(ruta):
+        print("[ERROR] SKIP_%s=true pero no existe el CSV a reusar: %s\n"
+              "        Genera uno con una corrida previa que use "
+              "SYNC_KEEP_INTERMEDIATE=true, o desactiva SKIP_%s."
+              % (base.upper(), ruta, base.upper()), file=sys.stderr)
+        sys.exit(2)
+      print("[FULL_SYNC] SKIP_%s=true: se reusa %s (%s)."
+            % (base.upper(), ruta, peso_archivo(ruta)))
 
-  if SKIP_PSX:
-    _reusar_o_error("psx")
-  else:
-    descargar_psx()
+    if SKIP_ABD:
+      _reusar_o_error("abd")
+    else:
+      descargar_abd()
 
-  # 2) Troceo por prefijo (si el loteo esta activo) y comparacion. comparar()
-  #    carga solo un lote por lado a la vez (control de memoria).
-  print("[FULL_SYNC] === Iniciando TROCEO por prefijo (%d lote(s)) ===" % len(prefijos))
-  t_split = time.monotonic()
-  split_por_prefijo("abd", prefijos)
-  split_por_prefijo("psx", prefijos)
-  print("[FULL_SYNC] Troceo completado en %.1fs." % (time.monotonic() - t_split))
+    if SKIP_PSX:
+      _reusar_o_error("psx")
+    else:
+      descargar_psx()
 
-  print("[FULL_SYNC] === Iniciando COMPARACION (ABD vs PSX) ===")
-  t_cmp = time.monotonic()
-  lineas_put, lineas_del = comparar(prefijos)
-  print("[FULL_SYNC] Comparacion completada en %.1fs." % (time.monotonic() - t_cmp))
+    # 2) Troceo por prefijo (si el loteo esta activo) y comparacion. comparar()
+    #    carga solo un lote por lado a la vez (control de memoria).
+    print("[FULL_SYNC] === Iniciando TROCEO por prefijo (%d lote(s)) ===" % len(prefijos))
+    t_split = time.monotonic()
+    split_por_prefijo("abd", prefijos)
+    split_por_prefijo("psx", prefijos)
+    print("[FULL_SYNC] Troceo completado en %.1fs." % (time.monotonic() - t_split))
 
-  print("[FULL_SYNC] === Escribiendo CSV de diferencias ===")
-  escribir_salida("PORTED", label, lineas_put)
-  escribir_salida("DELETED", label, lineas_del)
+    print("[FULL_SYNC] === Iniciando COMPARACION (ABD vs PSX) ===")
+    t_cmp = time.monotonic()
+    lineas_put, lineas_del = comparar(prefijos)
+    print("[FULL_SYNC] Comparacion completada en %.1fs." % (time.monotonic() - t_cmp))
 
-  limpiar_intermedios(prefijos)
+    print("[FULL_SYNC] === Escribiendo CSV de diferencias ===")
+    escribir_salida("PORTED", label, lineas_put)
+    escribir_salida("DELETED", label, lineas_del)
+
+    limpiar_intermedios(prefijos)
 
   # 3) Ejecucion de las diferencias contra el equipo (salvo --no-execute).
   #    Reutiliza el pipeline completo de mtysajpsx01 (chunks, reintentos,
