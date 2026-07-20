@@ -46,13 +46,29 @@ MAIL_TO = [x.strip() for x in os.environ.get("MAIL_TO", "").split(",") if x.stri
 # Configuracion de conexion
 # ---------------------------------------------------------------------------
 SSH_HOST = os.environ.get("SSH_HOST", "")
+# Puerto de la SESION CLI del EMS (ssh interactivo a la consola SONUS/EMS). En
+# estos equipos suele ser un puerto propio de la CLI (p. ej. 8122), distinto del
+# SSH estandar del sistema operativo por el que viaja el scp de archivos.
 SSH_PORT = os.environ.get("SSH_PORT", "")
 SSH_USER = os.environ.get("SSH_USER", "")
 CLI_PASSWORD = os.environ.get("CLI_PASSWORD", "")
 CLI_INSTANCE = os.environ.get("CLI_INSTANCE", "")
 FILE_PREFIX = os.environ.get("FILE_PREFIX", "")
 SCP_USER = os.environ.get("SCP_USER", "")
+# Puerto del scp de los archivos. Es el SSH del SISTEMA OPERATIVO (por defecto 22),
+# NO el de la CLI: el scp copia archivos al filesystem del equipo, no entra a la
+# consola CLI. Se separa de SSH_PORT porque en el EMS son puertos distintos.
+SCP_PORT = os.environ.get("SCP_PORT", "22")
 SCP_DEST_PATH = os.environ.get("SCP_DEST_PATH", "")
+
+# Modo debug de la sesion CLI (pexpect) y del scp. Con true:
+#   - duplica TODA la salida del pexpect a la pantalla (ademas del archivo de log
+#     LOG_DIR/<parte>.csv, que se conserva),
+#   - imprime el comando ssh que se lanza, los comandos que se envian a la CLI y
+#     el comando scp completo.
+# Se activa con CLI_DEBUG=true o, para reutilizar el mismo switch del full_sync,
+# con SYNC_DEBUG=true. Por defecto false (salida solo al archivo de log).
+CLI_DEBUG = env_bool("CLI_DEBUG", False) or env_bool("SYNC_DEBUG", False)
 
 # ---------------------------------------------------------------------------
 # Rutas y parametros del proceso
@@ -105,6 +121,7 @@ def validar_configuracion():
     "CLI_INSTANCE": CLI_INSTANCE,
     "FILE_PREFIX": FILE_PREFIX,
     "SCP_USER": SCP_USER,
+    "SCP_PORT": SCP_PORT,
     "SCP_DEST_PATH": SCP_DEST_PATH,
     "DIRFILES": DIRFILES,
     "LOG_DIR": LOG_DIR,
@@ -265,15 +282,22 @@ def EXPECT(nombre_parte):
   parte (sin extension), p.ej. 'MTYSAJPSX01_PORTED_20260717_1' o
   'MTYSAJPSX01_PORTED_1'. Lanza una excepcion si falla la conexion o si algun
   comando no completa/reporta error."""
+  ssh_cmd = f'ssh -p {SSH_PORT} -o User={SSH_USER} {SSH_USER}@{SSH_HOST}'
+  if CLI_DEBUG:
+    print("[CLI_DEBUG] Abriendo sesion CLI: %s" % ssh_cmd)
   try:
     # '-o User=' fuerza el usuario del .env por encima de cualquier ~/.ssh/config
     # del proceso (p. ej. airflow), para no conectarse como otro usuario (root).
-    cmd = pexpect.spawn(f'ssh -p {SSH_PORT} -o User={SSH_USER} {SSH_USER}@{SSH_HOST}', timeout=2400)
+    cmd = pexpect.spawn(ssh_cmd, timeout=2400)
   except Exception as e:
     raise ConnectionError("No se pudo iniciar la conexion ssh a %s:%s (%s)" % (SSH_HOST, SSH_PORT, e))
 
+  # El log del pexpect siempre va al archivo LOG_DIR/<parte>.csv. Con CLI_DEBUG
+  # ademas se duplica a pantalla SOLO lo que llega del equipo (logfile_read), no
+  # lo que enviamos (logfile_send), para no imprimir el CLI_PASSWORD en consola.
   cmd.logfile = open("%s/%s.csv" % (LOG_DIR, nombre_parte), "wb")
-  #cmd.logfile=sys.stdout.buffer
+  if CLI_DEBUG:
+    cmd.logfile_read = sys.stdout.buffer
   cmd.setecho(False)
   cmd.delaybeforesend = 0.8
   cmd.delayafterclose = 0.5
@@ -294,6 +318,10 @@ def EXPECT(nombre_parte):
       raise ConnectionError("No se obtuvo el prompt inicial de %s (posible fallo de conexion)" % SSH_HOST)
 
     for c in comandos:
+      if CLI_DEBUG:
+        # El primer comando es el CLI_PASSWORD: no lo imprimimos en claro.
+        mostrado = "<CLI_PASSWORD>" if c == CLI_PASSWORD else c
+        print("[CLI_DEBUG] >>> %s" % mostrado)
       cmd.sendline(c)
       idx = cmd.expect(buscar + [pexpect.EOF, pexpect.TIMEOUT])
       if idx >= len(buscar):
@@ -364,7 +392,7 @@ def _intentar_parte_una_tanda(tipo, fecha, parte):
   # '-o User=' fuerza el usuario del .env por encima de cualquier ~/.ssh/config
   # del que corra el proceso (p. ej. airflow), para que el scp NUNCA se conecte
   # como otro usuario (root) aunque el config del host diga lo contrario.
-  scp_opts = f"-P {SSH_PORT} -o User={SCP_USER}"
+  scp_opts = f"-P {SCP_PORT} -o User={SCP_USER}"
 
   intento = 0
   ultima_exc = None
@@ -372,6 +400,8 @@ def _intentar_parte_una_tanda(tipo, fecha, parte):
     intento += 1
     try:
       # Validacion del scp: os.system devuelve el estado de salida; !=0 es fallo.
+      if CLI_DEBUG:
+        print("[CLI_DEBUG] scp %s %s %s" % (scp_opts, origen, destino))
       rc = os.system(f"scp {scp_opts} {origen} {destino}")
       if rc != 0:
         raise ConnectionError(
