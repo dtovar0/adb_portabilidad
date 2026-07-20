@@ -266,7 +266,9 @@ def EXPECT(nombre_parte):
   'MTYSAJPSX01_PORTED_1'. Lanza una excepcion si falla la conexion o si algun
   comando no completa/reporta error."""
   try:
-    cmd = pexpect.spawn(f'ssh -p {SSH_PORT} {SSH_USER}@{SSH_HOST}', timeout=2400)
+    # '-o User=' fuerza el usuario del .env por encima de cualquier ~/.ssh/config
+    # del proceso (p. ej. airflow), para no conectarse como otro usuario (root).
+    cmd = pexpect.spawn(f'ssh -p {SSH_PORT} -o User={SSH_USER} {SSH_USER}@{SSH_HOST}', timeout=2400)
   except Exception as e:
     raise ConnectionError("No se pudo iniciar la conexion ssh a %s:%s (%s)" % (SSH_HOST, SSH_PORT, e))
 
@@ -329,8 +331,10 @@ def accion_correctiva():
   destino = f"{RECOVERY_SSH_USER}@{RECOVERY_SSH_HOST}"
   # -o BatchMode: no pedir password interactivo; -o StrictHostKeyChecking=no
   # para no bloquearse por host key. ConnectTimeout limita el intento.
+  # -o User: fuerza el usuario del .env por encima de cualquier ~/.ssh/config.
   ssh_cmd = (
     f"ssh -p {RECOVERY_SSH_PORT} "
+    f"-o User={RECOVERY_SSH_USER} "
     f"-o BatchMode=yes -o StrictHostKeyChecking=no "
     f"-o ConnectTimeout={RECOVERY_TIMEOUT} "
     f"{destino} '{RECOVERY_CMD}'"
@@ -357,6 +361,10 @@ def _intentar_parte_una_tanda(tipo, fecha, parte):
     raise FileNotFoundError("No se encontro la parte a enviar por scp: %s" % origen)
 
   destino = f"{SCP_USER}@{SSH_HOST}:{SCP_DEST_PATH}"
+  # '-o User=' fuerza el usuario del .env por encima de cualquier ~/.ssh/config
+  # del que corra el proceso (p. ej. airflow), para que el scp NUNCA se conecte
+  # como otro usuario (root) aunque el config del host diga lo contrario.
+  scp_opts = f"-P {SSH_PORT} -o User={SCP_USER}"
 
   intento = 0
   ultima_exc = None
@@ -364,7 +372,7 @@ def _intentar_parte_una_tanda(tipo, fecha, parte):
     intento += 1
     try:
       # Validacion del scp: os.system devuelve el estado de salida; !=0 es fallo.
-      rc = os.system(f"scp {origen} {destino}")
+      rc = os.system(f"scp {scp_opts} {origen} {destino}")
       if rc != 0:
         raise ConnectionError(
           "Fallo el scp de la parte %d (codigo %s) hacia %s. "
