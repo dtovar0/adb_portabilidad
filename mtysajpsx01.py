@@ -551,6 +551,10 @@ def procesar_dia(tipo, fecha, host):
         "No se encontro el archivo de origen para procesar: %s" % archivo
       )
 
+    # Marca de tiempo para medir cuanto tarda la preparacion (lectura + troceo)
+    # antes del primer envio. Ayuda a ubicar retrasos entre la notificacion y el
+    # primer comando en el equipo.
+    t_prep = time.monotonic()
     with open(archivo, 'r') as fp:
       Lines = fp.readlines()
 
@@ -572,8 +576,9 @@ def procesar_dia(tipo, fecha, host):
         num0, num1,
       )
 
-    print("[INFO] (%s) Archivo de %d linea(s); se generaron %d parte(s)."
-          % (fecha, total_lineas, total_partes))
+    print("[INFO] (%s) Archivo de %d linea(s); se generaron %d parte(s) en %.1fs "
+          "(lectura + troceo)."
+          % (fecha, total_lineas, total_partes, time.monotonic() - t_prep))
 
     # --- Reanudacion: partes ya completadas segun el checkpoint ---
     ya_hechas = leer_checkpoint(tipo, fecha)
@@ -598,7 +603,9 @@ def procesar_dia(tipo, fecha, host):
       print("[INFO] (%s) Parte %d/%d procesada correctamente." % (fecha, check, total_partes))
 
       # No dormir despues de la ultima parte.
-      if check < total_partes:
+      if check < total_partes and SLEEP_BETWEEN > 0:
+        print("[INFO] (%s) Pausa de %ds antes de la parte %d/%d (SLEEP_BETWEEN)."
+              % (fecha, SLEEP_BETWEEN, check + 1, total_partes))
         time.sleep(SLEEP_BETWEEN)
 
     # Validacion final: todas las partes deben haberse ejecutado.
