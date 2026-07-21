@@ -450,6 +450,11 @@ def EXPECT(nombre_parte):
     'exit',
   ]
 
+  # Se marca True cuando el 'exit' completa el cierre de la sesion. Sirve para
+  # distinguir el codigo de salida ssh 255 "benigno" (el equipo corta la conexion
+  # tras el exit) de un 255 real (corte a mitad del batch).
+  sesion_cerrada_ok = False
+
   try:
     # Espera inicial del prompt/password: si no aparece, es fallo de conexion.
     idx = cmd.expect(buscar + [pexpect.EOF, pexpect.TIMEOUT])
@@ -466,8 +471,11 @@ def EXPECT(nombre_parte):
       idx = cmd.expect(buscar + [pexpect.EOF, pexpect.TIMEOUT])
       # 'exit' cierra la sesion: el EOF es la respuesta esperada, no una falla.
       # (idx == len(buscar) es EOF; len(buscar)+1 es TIMEOUT). Tras el EOF no hay
-      # mas prompt ni salida que validar, asi que se corta el loop aqui.
+      # mas prompt ni salida que validar, asi que se corta el loop aqui y se marca
+      # la sesion como cerrada correctamente (para tolerar el codigo ssh 255 que
+      # deja el equipo al cortar la conexion tras el exit).
       if c == 'exit' and idx == len(buscar):
+        sesion_cerrada_ok = True
         break
       if idx >= len(buscar):
         raise RuntimeError("El comando '%s' no completo (EOF/TIMEOUT)" % c_mostrado)
@@ -506,8 +514,16 @@ def EXPECT(nombre_parte):
     except Exception:
       pass
 
-  # Verifica que el subproceso ssh haya terminado con codigo 0
-  if cmd.exitstatus not in (0, None):
+  # Verifica el codigo de salida del subproceso ssh. El 255 es el codigo generico
+  # de ssh cuando el host remoto corta la conexion; el EMS suele hacerlo tras el
+  # 'exit' ("Connection ... closed by remote host") en vez de un cierre limpio con
+  # codigo 0. Ese 255 NO es una falla si ya completamos el exit correctamente, asi
+  # que se tolera solo en ese caso. Un 255 sin haber cerrado bien (corte a mitad
+  # del batch) si es falla.
+  codigos_ok = (0, None)
+  if sesion_cerrada_ok:
+    codigos_ok = (0, None, 255)
+  if cmd.exitstatus not in codigos_ok:
     raise RuntimeError("La sesion ssh termino con codigo %s" % cmd.exitstatus)
 
   # Con la sesion cerrada y el logfile ya en disco: se valida que el EMS haya
