@@ -357,6 +357,11 @@ def EXPECT(nombre_parte):
         print("[CLI_DEBUG] >>> %s" % c_mostrado)
       cmd.sendline(c)
       idx = cmd.expect(buscar + [pexpect.EOF, pexpect.TIMEOUT])
+      # 'exit' cierra la sesion: el EOF es la respuesta esperada, no una falla.
+      # (idx == len(buscar) es EOF; len(buscar)+1 es TIMEOUT). Tras el EOF no hay
+      # mas prompt ni salida que validar, asi que se corta el loop aqui.
+      if c == 'exit' and idx == len(buscar):
+        break
       if idx >= len(buscar):
         raise RuntimeError("El comando '%s' no completo (EOF/TIMEOUT)" % c_mostrado)
 
