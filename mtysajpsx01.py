@@ -290,11 +290,12 @@ def extract_lines(input_file, output_file, start_line, end_line):
     lines = infile.readlines()
 
   with open(output_file, 'w') as outfile:
-    # NO se antepone el header '?EMS::CLI?': el archivo se ejecuta con
-    # 'execute batch_script <archivo>' y el equipo lo lee del filesystem esperando
-    # solo comandos put/delete. El header no es un comando valido y hacia que el
-    # equipo se colgara tras el primer comando. (Sin header las partes procesan
-    # todos los comandos, como funcionaba antes.)
+    # El header '?EMS::CLI?' va en la PRIMERA linea de TODAS las partes: el equipo
+    # valida que el batch_script empiece con este marcador y, si falta, rechaza el
+    # archivo con "The input script file is NOT a valid EMS::CLI script! @[line: 1,
+    # command#: 0]". (Se habia quitado por error en 8298e38; el equipo lo exige.)
+    outfile.write("?EMS::CLI?\n")
+
     for i in range(start_line, end_line):
       if 0 <= i < len(lines):
         outfile.write(lines[i])
