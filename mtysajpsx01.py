@@ -352,45 +352,54 @@ def validar_batch(nombre_parte):
   ya cerrado en disco (LOG_DIR/<parte>.csv) en vez de mantenerlo en memoria.
 
   Hace DOS comprobaciones sobre el log:
-    1) Cuenta las lineas 'Executing: <cmd>' (una por cada put/delete que el EMS
-       ejecuta dentro del batch) y las compara contra el numero de comandos del
-       batch enviado (DIRFILES/<parte>.csv, sin contar el header '?EMS::CLI?').
-       Se cuenta 'Executing:' y NO 'Result: Ok' porque el propio comando
-       'execute batch_script' emite un 'Result: Ok' extra al terminar, que
-       inflaba la cuenta en 1 (daba 20001 de 20000). 'Executing:' solo aparece
-       por cada comando real del batch.
+    1) Cuenta los 'Result: Ok' del log y los compara contra el TOTAL de lineas del
+       archivo de la parte CONTANDO el header '?EMS::CLI?'. El log trae un
+       'Result: Ok' de mas (el que emite el propio 'execute batch_script' al
+       terminar, ademas del de cada put/delete); ese +1 se compensa contando el
+       header en los esperados, asi ambos lados quedan iguales. El conteo se hace
+       contra las lineas del propio archivo de la parte, NO contra un fijo de
+       CHUNK_SIZE: el ultimo chunk suele tener menos de CHUNK_SIZE lineas y
+       compararlo contra 20k lo marcaria mal siempre.
     2) Confirma que el ULTIMO comando ejecutado por el EMS ('Executing: <cmd>' en
        el log) sea exactamente el ULTIMO comando del batch. Asi se asegura que el
-       EMS llego hasta el final real y no solo que hubo N ejecuciones sueltas.
+       EMS llego hasta el final real y no solo que hubo N oks sueltos.
   Si algo no cuadra (corte por timeout/desconexion, ultimo comando distinto) lanza
   RuntimeError con el detalle."""
   batch = "%s/%s.csv" % (DIRFILES, nombre_parte)
   log = "%s/%s.csv" % (LOG_DIR, nombre_parte)
 
-  # Comandos reales del batch = lineas no vacias menos el header '?EMS::CLI?'.
+  # Lineas no vacias del archivo de la parte (header + comandos). Se ignoran
+  # lineas en blanco por si el archivo termina en salto final.
   with open(batch, "r") as f:
-    comandos = [ln.strip() for ln in f if ln.strip() and ln.strip() != "?EMS::CLI?"]
-  esperados = len(comandos)
-  ultimo_batch = comandos[-1] if comandos else ""
+    lineas = [ln.strip() for ln in f if ln.strip()]
+  # esperados = TODAS las lineas CONTANDO el header: el header no genera comando,
+  # pero su +1 compensa el 'Result: Ok' extra del 'execute batch_script'.
+  esperados = len(lineas)
+  # Para comparar el ultimo comando si se necesita el ultimo comando REAL, sin el
+  # header (el header solo va al inicio, nunca al final).
+  ultimo_batch = lineas[-1] if lineas else ""
 
-  # Recorre el log una sola vez: cuenta las lineas 'Executing:' (una por comando
-  # del batch) y captura el ultimo comando que el EMS reporto haber ejecutado.
+  # Recorre el log una sola vez: cuenta los 'Result: Ok' (incluye el +1 del
+  # execute batch_script) y captura el ultimo comando ejecutado ('Executing:').
+  patron_ok = re.compile(r"result:\s*ok", re.IGNORECASE)
   patron_exec = re.compile(r"executing:\s*(.+?)\s*$", re.IGNORECASE)
   obtenidos = 0
   ultimo_log = None
   with open(log, "r", errors="ignore") as f:
     for ln in f:
+      if patron_ok.search(ln):
+        obtenidos += 1
       m = patron_exec.search(ln)
       if m:
-        obtenidos += 1
         ultimo_log = m.group(1).strip()
 
-  # 1) La cuenta de comandos ejecutados debe coincidir con los comandos enviados.
+  # 1) La cuenta de 'Result: Ok' (con el +1 del execute) debe coincidir con las
+  # lineas del archivo (con el +1 del header).
   if obtenidos != esperados:
     raise RuntimeError(
-      "Batch incompleto en %s: %d de %d comandos ejecutados ('Executing:'). "
-      "El EMS no ejecuto todos los comandos (posible corte antes del final)."
-      % (nombre_parte, obtenidos, esperados)
+      "Batch incompleto en %s: %d 'Result: Ok' vs %d lineas del archivo "
+      "(header incluido). El EMS no ejecuto todos los comandos (posible corte "
+      "antes del final)." % (nombre_parte, obtenidos, esperados)
     )
 
   # 2) El ultimo comando ejecutado debe ser el ultimo comando del batch.
@@ -405,7 +414,7 @@ def validar_batch(nombre_parte):
       "  esperado: %s\n  en log:   %s" % (nombre_parte, ultimo_batch, ultimo_log)
     )
 
-  print("[VALIDACION] %s: %d/%d comandos ejecutados; ultimo comando OK."
+  print("[VALIDACION] %s: %d 'Result: Ok' == %d lineas (header incluido); ultimo comando OK."
         % (nombre_parte, obtenidos, esperados))
 
 
