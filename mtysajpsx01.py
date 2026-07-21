@@ -274,12 +274,23 @@ def leer_checkpoint(tipo, fecha):
 
 
 def marcar_parte_completada(tipo, fecha, parte):
-  """Registra (append + flush) que una parte se completo, para poder reanudar."""
-  os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-  with open(checkpoint_path(tipo, fecha), "a") as f:
-    f.write("%d\n" % parte)
-    f.flush()
-    os.fsync(f.fileno())
+  """Registra (append + flush) que una parte se completo, para poder reanudar.
+  Si el checkpoint no se puede escribir (dir inexistente/sin permisos) se lanza
+  excepcion en vez de perderlo en silencio: sin checkpoint no hay reanudacion y el
+  proceso reiniciaria desde el principio, justo lo que se quiere evitar."""
+  ruta = checkpoint_path(tipo, fecha)
+  try:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    with open(ruta, "a") as f:
+      f.write("%d\n" % parte)
+      f.flush()
+      os.fsync(f.fileno())
+  except OSError as e:
+    raise RuntimeError(
+      "No se pudo escribir el checkpoint '%s' (parte %d): %s. Sin checkpoint no "
+      "hay reanudacion; revisa CHECKPOINT_DIR/LOG_DIR y sus permisos."
+      % (ruta, parte, e)
+    )
 
 
 def borrar_checkpoint(tipo, fecha):
@@ -678,12 +689,16 @@ def procesar_dia(tipo, fecha, host):
           % (fecha, total_lineas, total_partes, time.monotonic() - t_prep))
 
     # --- Reanudacion: partes ya completadas segun el checkpoint ---
+    print("[CHECKPOINT] (%s) Archivo de reanudacion: %s" % (fecha, checkpoint_path(tipo, fecha)))
     ya_hechas = leer_checkpoint(tipo, fecha)
     ya_hechas = {p for p in ya_hechas if 1 <= p <= total_partes}
     comandos_ok = len(ya_hechas)
     if ya_hechas:
       print("[REANUDAR] (%s) Se reanuda: %d de %d parte(s) ya completadas (%s)."
             % (fecha, comandos_ok, total_partes, ",".join(str(p) for p in sorted(ya_hechas))))
+    else:
+      print("[CHECKPOINT] (%s) Sin checkpoint previo: se procesan las %d parte(s) desde el inicio."
+            % (fecha, total_partes))
 
     # --- Procesamiento de cada parte (con reintentos y checkpoint) ---
     for check in range(1, total_partes + 1):
