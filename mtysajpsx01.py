@@ -352,12 +352,16 @@ def validar_batch(nombre_parte):
   ya cerrado en disco (LOG_DIR/<parte>.csv) en vez de mantenerlo en memoria.
 
   Hace DOS comprobaciones sobre el log:
-    1) Cuenta los 'Result: Ok' (unica salida positiva del EMS, uno por comando) y
-       los compara contra el numero de comandos del batch enviado
-       (DIRFILES/<parte>.csv, sin contar el header '?EMS::CLI?').
+    1) Cuenta las lineas 'Executing: <cmd>' (una por cada put/delete que el EMS
+       ejecuta dentro del batch) y las compara contra el numero de comandos del
+       batch enviado (DIRFILES/<parte>.csv, sin contar el header '?EMS::CLI?').
+       Se cuenta 'Executing:' y NO 'Result: Ok' porque el propio comando
+       'execute batch_script' emite un 'Result: Ok' extra al terminar, que
+       inflaba la cuenta en 1 (daba 20001 de 20000). 'Executing:' solo aparece
+       por cada comando real del batch.
     2) Confirma que el ULTIMO comando ejecutado por el EMS ('Executing: <cmd>' en
        el log) sea exactamente el ULTIMO comando del batch. Asi se asegura que el
-       EMS llego hasta el final real y no solo que hubo N oks sueltos.
+       EMS llego hasta el final real y no solo que hubo N ejecuciones sueltas.
   Si algo no cuadra (corte por timeout/desconexion, ultimo comando distinto) lanza
   RuntimeError con el detalle."""
   batch = "%s/%s.csv" % (DIRFILES, nombre_parte)
@@ -369,24 +373,22 @@ def validar_batch(nombre_parte):
   esperados = len(comandos)
   ultimo_batch = comandos[-1] if comandos else ""
 
-  # Recorre el log una sola vez: cuenta 'Result: Ok' y captura el ultimo comando
-  # que el EMS reporto haber ejecutado ('Executing: <cmd>').
-  patron_ok = re.compile(r"result:\s*ok", re.IGNORECASE)
+  # Recorre el log una sola vez: cuenta las lineas 'Executing:' (una por comando
+  # del batch) y captura el ultimo comando que el EMS reporto haber ejecutado.
   patron_exec = re.compile(r"executing:\s*(.+?)\s*$", re.IGNORECASE)
   obtenidos = 0
   ultimo_log = None
   with open(log, "r", errors="ignore") as f:
     for ln in f:
-      if patron_ok.search(ln):
-        obtenidos += 1
       m = patron_exec.search(ln)
       if m:
+        obtenidos += 1
         ultimo_log = m.group(1).strip()
 
-  # 1) La cuenta de 'Result: Ok' debe coincidir con los comandos enviados.
+  # 1) La cuenta de comandos ejecutados debe coincidir con los comandos enviados.
   if obtenidos != esperados:
     raise RuntimeError(
-      "Batch incompleto en %s: %d de %d comandos con 'Result: Ok'. "
+      "Batch incompleto en %s: %d de %d comandos ejecutados ('Executing:'). "
       "El EMS no ejecuto todos los comandos (posible corte antes del final)."
       % (nombre_parte, obtenidos, esperados)
     )
@@ -403,7 +405,7 @@ def validar_batch(nombre_parte):
       "  esperado: %s\n  en log:   %s" % (nombre_parte, ultimo_batch, ultimo_log)
     )
 
-  print("[VALIDACION] %s: %d/%d comandos ejecutados (Result: Ok); ultimo comando OK."
+  print("[VALIDACION] %s: %d/%d comandos ejecutados; ultimo comando OK."
         % (nombre_parte, obtenidos, esperados))
 
 
