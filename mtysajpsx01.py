@@ -1,4 +1,5 @@
 import pexpect, argparse, sys, os
+import re
 import time
 import smtplib
 import socket
@@ -307,6 +308,39 @@ def extract_lines(input_file, output_file, start_line, end_line):
         outfile.write(lines[i])
 
 
+def validar_batch(nombre_parte):
+  """Valida que el EMS ejecuto TODOS los comandos del batch, leyendo el logfile
+  ya cerrado en disco (LOG_DIR/<parte>.csv) en vez de mantenerlo en memoria.
+
+  La unica salida positiva del EMS es 'Result: Ok' (uno por comando), asi que se
+  cuentan y se comparan contra el numero de comandos del batch enviado
+  (DIRFILES/<parte>.csv, sin contar el header '?EMS::CLI?'). Si el EMS se corto
+  antes del ultimo comando (p. ej. por timeout o desconexion) habra menos
+  'Result: Ok' que comandos y aqui se detecta. Lanza RuntimeError si no cuadran."""
+  batch = "%s/%s.csv" % (DIRFILES, nombre_parte)
+  log = "%s/%s.csv" % (LOG_DIR, nombre_parte)
+
+  # Comandos reales del batch = lineas no vacias menos el header '?EMS::CLI?'.
+  with open(batch, "r") as f:
+    lineas = [ln for ln in f if ln.strip()]
+  esperados = sum(1 for ln in lineas if ln.strip() != "?EMS::CLI?")
+
+  # 'Result: Ok' que reporto el EMS en el log (case-insensitive, tolerante a
+  # espacios: 'Result:Ok', 'Result:  OK', etc.).
+  patron_ok = re.compile(r"result:\s*ok", re.IGNORECASE)
+  with open(log, "r", errors="ignore") as f:
+    obtenidos = sum(1 for ln in f if patron_ok.search(ln))
+
+  if obtenidos != esperados:
+    raise RuntimeError(
+      "Batch incompleto en %s: %d de %d comandos con 'Result: Ok'. "
+      "El EMS no ejecuto todos los comandos (posible corte antes del final)."
+      % (nombre_parte, obtenidos, esperados)
+    )
+  print("[VALIDACION] %s: %d/%d comandos ejecutados (Result: Ok)."
+        % (nombre_parte, obtenidos, esperados))
+
+
 def EXPECT(nombre_parte):
   """Ejecuta el batch_script en el equipo remoto y valida que cada comando
   se complete correctamente. 'nombre_parte' es el nombre base del archivo de la
@@ -329,7 +363,8 @@ def EXPECT(nombre_parte):
   # El log del pexpect siempre va al archivo LOG_DIR/<parte>.csv. Con CLI_DEBUG
   # ademas se duplica a pantalla SOLO lo que llega del equipo (logfile_read), no
   # lo que enviamos (logfile_send), para no imprimir el CLI_PASSWORD en consola.
-  cmd.logfile = open("%s/%s.csv" % (LOG_DIR, nombre_parte), "wb")
+  logfile = open("%s/%s.csv" % (LOG_DIR, nombre_parte), "wb")
+  cmd.logfile = logfile
   if CLI_DEBUG:
     cmd.logfile_read = sys.stdout.buffer
   cmd.setecho(False)
@@ -371,6 +406,14 @@ def EXPECT(nombre_parte):
       if idx >= len(buscar):
         raise RuntimeError("El comando '%s' no completo (EOF/TIMEOUT)" % c_mostrado)
 
+      # El 'execute batch_script' NO se valida aqui: su salida son los CHUNK_SIZE
+      # 'Result: Ok' (bloque enorme). Cargarlo desde cmd.before y decodificarlo
+      # gastaria memoria de mas; se valida despues contra el logfile en disco con
+      # validar_batch(). Para los comandos de control (login/select/exit) si se
+      # inspecciona cmd.before, que es corto, buscando palabras de error.
+      if c.startswith("execute batch_script"):
+        continue
+
       # Validacion de la salida: buscar patrones de error en lo recibido.
       salida = (cmd.before or b"")
       if isinstance(salida, bytes):
@@ -389,10 +432,21 @@ def EXPECT(nombre_parte):
       cmd.close()
     except Exception:
       pass
+    # pexpect.close() no cierra el logfile del usuario: hay que cerrarlo aqui para
+    # vaciar el buffer a disco antes de que validar_batch() lo lea. Sin esto el log
+    # podria quedar incompleto y dar un falso 'batch incompleto'.
+    try:
+      logfile.close()
+    except Exception:
+      pass
 
   # Verifica que el subproceso ssh haya terminado con codigo 0
   if cmd.exitstatus not in (0, None):
     raise RuntimeError("La sesion ssh termino con codigo %s" % cmd.exitstatus)
+
+  # Con la sesion cerrada y el logfile ya en disco: se valida que el EMS haya
+  # ejecutado TODOS los comandos del batch (cuenta de 'Result: Ok').
+  validar_batch(nombre_parte)
 
 
 def accion_correctiva():
