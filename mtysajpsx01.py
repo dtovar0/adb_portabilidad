@@ -99,6 +99,12 @@ DIRFILES = os.environ.get("DIRFILES", "")
 LOG_DIR = os.environ.get("LOG_DIR", "")
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "20000"))
 SLEEP_BETWEEN = int(os.environ.get("SLEEP_BETWEEN", "120"))
+# Tiempo maximo (segundos) que la sesion CLI espera el prompt del EMS. Cubre
+# sobre todo el 'execute batch_script', donde el EMS procesa los CHUNK_SIZE
+# comandos put/delete. Si una parte tarda mas que esto, pexpect corta con TIMEOUT
+# y la marca como fallida aunque el EMS siga trabajando: subirlo si el equipo es
+# lento o bajar CHUNK_SIZE. Default 2400s (40 min).
+CLI_TIMEOUT = int(os.environ.get("CLI_TIMEOUT", "2400"))
 
 # ---------------------------------------------------------------------------
 # Reintentos y reanudacion (checkpoint)
@@ -316,7 +322,7 @@ def EXPECT(nombre_parte):
   try:
     # '-o User=' fuerza el usuario del .env por encima de cualquier ~/.ssh/config
     # del proceso (p. ej. airflow), para no conectarse como otro usuario (root).
-    cmd = pexpect.spawn(ssh_cmd, timeout=2400)
+    cmd = pexpect.spawn(ssh_cmd, timeout=CLI_TIMEOUT)
   except Exception as e:
     raise ConnectionError("No se pudo iniciar la conexion ssh a %s:%s (%s)" % (SSH_HOST, SSH_PORT, e))
 
