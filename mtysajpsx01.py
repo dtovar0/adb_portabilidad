@@ -98,6 +98,10 @@ RUIDO_SSH_BENIGNO = (
 # ---------------------------------------------------------------------------
 DIRFILES = os.environ.get("DIRFILES", "")
 LOG_DIR = os.environ.get("LOG_DIR", "")
+# Con true (default) se crean al arrancar los directorios de trabajo (DIRFILES,
+# LOG_DIR, CHECKPOINT_DIR) si no existen, para no fallar por un directorio
+# inexistente. Con false se exige que ya existan (falla si falta alguno).
+CREATE_DIRS = env_bool("CREATE_DIRS", True)
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "20000"))
 SLEEP_BETWEEN = int(os.environ.get("SLEEP_BETWEEN", "120"))
 # Tiempo maximo (segundos) que la sesion CLI espera el prompt del EMS. Cubre
@@ -182,6 +186,30 @@ def validar_configuracion():
           % os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
           file=sys.stderr)
     sys.exit(2)
+
+  asegurar_directorios()
+
+
+def asegurar_directorios():
+  """Prepara los directorios de trabajo (DIRFILES, LOG_DIR, CHECKPOINT_DIR).
+  Con CREATE_DIRS=true (default) crea los que falten para no fallar por un
+  directorio inexistente. Con CREATE_DIRS=false solo verifica que existan y aborta
+  si falta alguno. Los duplicados (p. ej. CHECKPOINT_DIR heredando LOG_DIR) se
+  resuelven solos por el set."""
+  directorios = {d for d in (DIRFILES, LOG_DIR, CHECKPOINT_DIR) if str(d).strip()}
+  for d in sorted(directorios):
+    if os.path.isdir(d):
+      continue
+    if CREATE_DIRS:
+      try:
+        os.makedirs(d, exist_ok=True)
+        print("[DIRS] Directorio creado: %s" % d)
+      except OSError as e:
+        print("[ERROR] No se pudo crear el directorio '%s': %s" % (d, e), file=sys.stderr)
+        sys.exit(2)
+    else:
+      print("[ERROR] El directorio '%s' no existe y CREATE_DIRS=false." % d, file=sys.stderr)
+      sys.exit(2)
 
 
 def send_notification(kind, subject, body):
