@@ -1,5 +1,4 @@
 import pexpect, argparse, sys, os
-import re
 import time
 import smtplib
 import socket
@@ -678,16 +677,17 @@ def rango_de_fechas(desde, hasta):
 # Patrones (REGEX) que se esperan del CLI remoto: prompt de password y prompt del
 # shell CLI. pexpect.expect() interpreta estos strings como expresiones regulares.
 #
-# El prompt real del equipo es de la forma 'PSX:V12.02.07R000:mtysajpsx01>' y
-# termina en el nombre de la instancia + '>'. Se ancla el patron a ese prompt
-# concreto ('<instancia>>') en vez de un '>' generico: un '>' suelto casaria
-# demasiado pronto (p. ej. el prompt que ya quedo en el buffer del comando
-# anterior), haciendo que el codigo mande el siguiente comando antes de que el
-# batch_script termine. Anclar al prompt de la instancia garantiza que solo se
-# avanza cuando el equipo realmente volvio a pedir input.
-# Global de modulo: lo usa EXPECT(); PROMPT_CLI se arma con CLI_INSTANCE.
-PROMPT_CLI = re.escape(CLI_INSTANCE) + ">"
-buscar = ['Password:\\s*', PROMPT_CLI]
+# El prompt real del equipo tiene DOS formas segun la fase:
+#   1) Tras el login (banner 'Sonus Insight...') el equipo muestra un prompt
+#      generico '> ' que AUN no incluye la instancia.
+#   2) Ya dentro de la sesion CLI (tras seleccionar el target) el prompt puede ser
+#      de la forma 'PSX:V12.02.07R000:mtysajpsx01>'.
+# Ambos terminan en '>', asi que el patron '>\s*' (mayor-que + espacios/salto
+# opcionales) casa las dos fases. NO anclar al nombre de la instancia: el prompt
+# inicial no lo trae y la sesion se colgaba hasta el timeout esperandolo. Tampoco
+# anclar con '$': la salida llega en fragmentos y podria casar prematuramente.
+# Global de modulo: lo usa EXPECT().
+buscar = ['Password:\\s*', '>\\s*']
 
 
 def resolver_fechas(date=None, date_from=None, date_to=None):
