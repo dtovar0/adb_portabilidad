@@ -37,7 +37,8 @@ import time
 # ---------------------------------------------------------------------------
 try:
   from dotenv import load_dotenv
-  load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+  # El .env vive en la raiz del repo (un nivel arriba de utils/), compartido con backend/.
+  load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 except ImportError:
   pass
 

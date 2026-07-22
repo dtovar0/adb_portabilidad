@@ -1,0 +1,104 @@
+// Esquema de la BD de tracking de portabilidad.
+//
+// Provider DUAL: el motor se elige con la variable de entorno DB_PROVIDER
+// ("postgresql" o "mysql"). Al cambiarla, ajusta tambien DATABASE_URL y
+// vuelve a correr las migraciones. Ver backend/.env.example.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  // Prisma NO admite env() en 'provider' (debe ser literal). El motor se controla
+  // con DB_PROVIDER via el script `npm run db:provider`, que reescribe esta linea
+  // ("postgresql" o "mysql") antes de generar/migrar. No editar a mano.
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Estado ACTUAL de cada numero portado. Una fila por numero.
+model Number {
+  /// Numero nacional de 10 digitos (identidad).
+  number       String   @id @db.VarChar(10)
+  /// Operador actual (CarrierRecipientId del ABD / 3 primeros chars del PSX).
+  operator     String   @db.VarChar(16)
+  /// NIR derivado del numero (2 digitos para 55/33/81, 3 para el resto).
+  nir          String?  @db.VarChar(3)
+  /// Entidad federativa derivada del NIR (catalogo IFT).
+  state        String?  @db.VarChar(64)
+  /// Poblacion/ciudad principal del NIR (informativo, puede ir vacio).
+  municipality String?  @db.VarChar(96)
+  /// Modalidad del rango segun IFT: FIJO / CPP (movil) / MPP.
+  modalidad    String?  @db.VarChar(8)
+  /// active = presente en la fuente; deleted = dado de baja.
+  status       String   @default("active") @db.VarChar(8)
+  /// Cuantas veces ha cambiado (alta/baja/cambio de operador) desde firstSeenAt.
+  changeCount  Int      @default(0)
+  firstSeenAt  DateTime @default(now())
+  lastChangeAt DateTime @default(now())
+
+  events NumberEvent[]
+
+  // Indices para las agregaciones del dashboard y filtros combinados.
+  @@index([state])
+  @@index([operator])
+  @@index([modalidad])
+  @@index([status])
+  @@index([state, operator])
+  @@index([status, state])
+  @@map("numbers")
+}
+
+/// Historial de eventos por numero: responde "cuando y cuantas veces cambio".
+model NumberEvent {
+  id           BigInt   @id @default(autoincrement())
+  number       String   @db.VarChar(10)
+  /// PORTED (alta) | DELETED (baja) | OPERATOR_CHANGE (cambio de operador).
+  eventType    String   @db.VarChar(16)
+  operatorFrom String?  @db.VarChar(16)
+  operatorTo   String?  @db.VarChar(16)
+  /// Origen del evento: ABD | PSX | CSV_PORTED | CSV_DELETED | BOOTSTRAP.
+  source       String   @db.VarChar(16)
+  /// Etiqueta de la corrida que genero el evento (--label de full_sync, o fecha).
+  runLabel     String?  @db.VarChar(64)
+  occurredAt   DateTime @default(now())
+
+  numberRef Number @relation(fields: [number], references: [number], onDelete: Cascade)
+
+  // Historial por numero, series temporales y altas/bajas por fecha.
+  @@index([number])
+  @@index([occurredAt])
+  @@index([eventType, occurredAt])
+  @@map("number_events")
+}
+
+/// Catalogo NIR -> estado (IFT). Se carga con el seed desde data/nir_estado.csv.
+model NirCatalog {
+  /// NIR de 2 o 3 digitos.
+  nir        String  @id @db.VarChar(3)
+  state      String  @db.VarChar(64)
+  population String? @db.VarChar(96)
+
+  @@index([state])
+  @@map("nir_catalog")
+}
+
+/// Metadata de cada ingesta/sincronizacion, para auditoria y el dashboard.
+model SyncRun {
+  id          BigInt    @id @default(autoincrement())
+  /// abd | psx | csv
+  source      String    @db.VarChar(16)
+  runLabel    String?   @db.VarChar(64)
+  startedAt   DateTime  @default(now())
+  finishedAt  DateTime?
+  /// running | ok | error
+  status      String    @default("running") @db.VarChar(8)
+  totalSeen   Int       @default(0)
+  inserted    Int       @default(0)
+  updated     Int       @default(0)
+  deleted     Int       @default(0)
+  opChanges   Int       @default(0)
+  errorMsg    String?   @db.Text
+
+  @@index([source, startedAt])
+  @@map("sync_runs")
+}
