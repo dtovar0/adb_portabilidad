@@ -237,6 +237,22 @@ def send_notification(kind, subject, body):
     print("[NOTIFICACION] Error al enviar '%s': %s" % (subject, e), file=sys.stderr)
 
 
+def causa_timeout_cli(exc):
+  """Recorre la cadena de excepciones (la propia y sus __cause__/__context__)
+  buscando un TimeoutError, que es como EXPECT() marca el corte por CLI_TIMEOUT.
+  ejecutar_parte() envuelve ese TimeoutError en un RuntimeError/ServidorCaidoError,
+  asi que aqui se desanida para reconocer el motivo real. Devuelve el TimeoutError
+  encontrado (para reutilizar su mensaje) o None."""
+  visto = set()
+  e = exc
+  while e is not None and id(e) not in visto:
+    visto.add(id(e))
+    if isinstance(e, TimeoutError):
+      return e
+    e = e.__cause__ or e.__context__
+  return None
+
+
 def parse_run_date(date_str):
   """Interpreta la fecha de --date. Acepta 'YYYYMMDD' o 'YYYY-MM-DD'.
   Devuelve un objeto date, o None si no se puede interpretar."""
@@ -438,6 +454,11 @@ def EXPECT(nombre_parte):
   except Exception as e:
     raise ConnectionError("No se pudo iniciar la conexion ssh a %s:%s (%s)" % (SSH_HOST, SSH_PORT, e))
 
+  # Cronometro de la sesion (solo un timestamp: no retiene salida en memoria).
+  # Sirve para reportar cuanto tardo la parte y, cuando el expect corta por
+  # pexpect.TIMEOUT, distinguirlo del EOF e informar que se alcanzo CLI_TIMEOUT.
+  t_spawn = time.monotonic()
+
   # El log del pexpect siempre va al archivo LOG_DIR/<parte>.csv. Con CLI_DEBUG
   # ademas se duplica a pantalla SOLO lo que llega del equipo (logfile_read), no
   # lo que enviamos (logfile_send), para no imprimir el CLI_PASSWORD en consola.
@@ -468,8 +489,18 @@ def EXPECT(nombre_parte):
   sesion_cerrada_ok = False
 
   try:
+    # Indices de EOF y TIMEOUT dentro del resultado de expect(): buscar son los
+    # patrones "utiles" (prompts); tras ellos van EOF y TIMEOUT en ese orden.
+    IDX_EOF = len(buscar)
+    IDX_TIMEOUT = len(buscar) + 1
+
     # Espera inicial del prompt/password: si no aparece, es fallo de conexion.
     idx = cmd.expect(buscar + [pexpect.EOF, pexpect.TIMEOUT])
+    if idx == IDX_TIMEOUT:
+      raise TimeoutError(
+        "Se agoto CLI_TIMEOUT (%ss) esperando el prompt inicial de %s tras %.0fs "
+        "(el equipo no respondio a tiempo)" % (CLI_TIMEOUT, SSH_HOST, time.monotonic() - t_spawn)
+      )
     if idx >= len(buscar):
       raise ConnectionError("No se obtuvo el prompt inicial de %s (posible fallo de conexion)" % SSH_HOST)
 
@@ -482,15 +513,25 @@ def EXPECT(nombre_parte):
       cmd.sendline(c)
       idx = cmd.expect(buscar + [pexpect.EOF, pexpect.TIMEOUT])
       # 'exit' cierra la sesion: el EOF es la respuesta esperada, no una falla.
-      # (idx == len(buscar) es EOF; len(buscar)+1 es TIMEOUT). Tras el EOF no hay
-      # mas prompt ni salida que validar, asi que se corta el loop aqui y se marca
-      # la sesion como cerrada correctamente (para tolerar el codigo ssh 255 que
-      # deja el equipo al cortar la conexion tras el exit).
-      if c == 'exit' and idx == len(buscar):
+      # (idx == IDX_EOF es EOF; IDX_TIMEOUT es TIMEOUT). Tras el EOF no hay mas
+      # prompt ni salida que validar, asi que se corta el loop aqui y se marca la
+      # sesion como cerrada correctamente (para tolerar el codigo ssh 255 que deja
+      # el equipo al cortar la conexion tras el exit).
+      if c == 'exit' and idx == IDX_EOF:
         sesion_cerrada_ok = True
         break
-      if idx >= len(buscar):
-        raise RuntimeError("El comando '%s' no completo (EOF/TIMEOUT)" % c_mostrado)
+      # Corte por CLI_TIMEOUT: el comando tardo mas que el limite. Es el caso
+      # tipico del 'execute batch_script' (el batch gigante que no se valida en
+      # linea). Se reporta con la duracion medida y el comando en curso; el
+      # detalle de hasta donde llego el batch lo resuelve validar_batch() sobre
+      # el log en disco, sin necesidad de retener salida en memoria.
+      if idx == IDX_TIMEOUT:
+        raise TimeoutError(
+          "Se agoto CLI_TIMEOUT (%ss) durante '%s' tras %.0fs: el EMS tardo mas de "
+          "lo permitido en completar el comando" % (CLI_TIMEOUT, c_mostrado, time.monotonic() - t_spawn)
+        )
+      if idx == IDX_EOF:
+        raise RuntimeError("El comando '%s' no completo (EOF inesperado: la sesion se corto)" % c_mostrado)
 
       # El 'execute batch_script' NO se valida aqui: su salida son los CHUNK_SIZE
       # 'Result: Ok' (bloque enorme). Cargarlo desde cmd.before y decodificarlo
@@ -638,11 +679,13 @@ def ejecutar_parte(tipo, fecha, parte):
 
     # Se agotaron los reintentos de esta tanda.
     if not RECOVERY_ENABLED:
-      # Sin recuperacion habilitada: fallo normal de la parte.
+      # Sin recuperacion habilitada: fallo normal de la parte. Se encadena con
+      # 'from exc' para conservar el motivo real (p. ej. el TimeoutError de
+      # CLI_TIMEOUT) y que la notificacion pueda reconocerlo.
       raise RuntimeError(
         "Parte %d fallo tras %d reintento(s): %s: %s"
         % (parte, SSH_RETRIES + 1, type(exc).__name__, exc)
-      )
+      ) from exc
     if ciclo >= RECOVERY_MAX_CYCLES:
       # Se agotaron tambien los ciclos de recuperacion (reboot): el equipo
       # sigue mal. Se marca como servidor caido para que el modo rango aborte.
@@ -650,7 +693,7 @@ def ejecutar_parte(tipo, fecha, parte):
         "Parte %d fallo tras %d reintento(s) y %d ciclo(s) de recuperacion; "
         "el equipo remoto sigue sin responder: %s: %s"
         % (parte, SSH_RETRIES + 1, RECOVERY_MAX_CYCLES, type(exc).__name__, exc)
-      )
+      ) from exc
 
     ciclo += 1
     print("[RECUPERACION] Parte %d agoto los reintentos; disparando accion "
@@ -787,19 +830,46 @@ def procesar_dia(tipo, fecha, host):
 
   except ServidorCaidoError as e:
     # El equipo remoto sigue caido tras la recuperacion: se notifica este dia
-    # y se propaga para que el modo rango aborte los dias restantes.
+    # y se propaga para que el modo rango aborte los dias restantes. Si la causa
+    # raiz fue un corte por CLI_TIMEOUT, se aclara en el cuerpo (el tiempo de
+    # ejecucion permitido fue demasiado corto, no una caida real del equipo).
+    to = causa_timeout_cli(e)
+    nota_timeout = (
+      "\nNota: el fallo se origino por agotar CLI_TIMEOUT=%ss (el comando no "
+      "alcanzo a completarse dentro del limite); considera aumentarlo." % CLI_TIMEOUT
+      if to is not None else ""
+    )
     send_notification(
       "error",
       "[Portabilidad] ERROR (servidor caido) %s %s" % (tipo, fecha),
       "El proceso de portabilidad %s fallo: el equipo remoto sigue "
       "sin responder tras la accion correctiva.\n"
       "Host: %s\nTipo: %s\nFecha: %s\n"
-      "Partes procesadas: %d de %s\nDetalle: %s\n"
-      % (FILE_PREFIX, host, tipo, fecha, comandos_ok, total_partes, e),
+      "Partes procesadas: %d de %s\nDetalle: %s\n%s"
+      % (FILE_PREFIX, host, tipo, fecha, comandos_ok, total_partes, e, nota_timeout),
     )
     print("[ERROR] (%s) SERVIDOR CAIDO: %s" % (fecha, e), file=sys.stderr)
     raise
   except Exception as e:
+    # Si el fallo (o su causa encadenada) es un corte por CLI_TIMEOUT, se envia
+    # una notificacion especifica: el problema no es una desconexion sino que el
+    # tiempo de ejecucion permitido (CLI_TIMEOUT) fue demasiado corto para el
+    # comando. El flujo de reintentos/recuperacion no cambia.
+    to = causa_timeout_cli(e)
+    if to is not None:
+      send_notification(
+        "error",
+        "[Portabilidad] ERROR (tiempo de ejecucion agotado) %s %s" % (tipo, fecha),
+        "El proceso de portabilidad %s fallo porque se agoto el tiempo de "
+        "ejecucion permitido de la CLI (CLI_TIMEOUT=%ss): el comando no alcanzo "
+        "a completarse dentro del limite. Considera aumentar CLI_TIMEOUT.\n"
+        "Host: %s\nTipo: %s\nFecha: %s\n"
+        "Partes procesadas: %d de %s\nDetalle: %s\n"
+        % (FILE_PREFIX, CLI_TIMEOUT, host, tipo, fecha, comandos_ok, total_partes, to),
+      )
+      print("[ERROR] (%s) CLI_TIMEOUT agotado: %s" % (fecha, to), file=sys.stderr)
+      return False
+
     send_notification(
       "error",
       "[Portabilidad] ERROR %s %s" % (tipo, fecha),
