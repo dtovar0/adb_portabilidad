@@ -994,11 +994,19 @@ def resolver_fechas(date=None, date_from=None, date_to=None):
   raise ValueError("Debes indicar date, o bien date_from y date_to.")
 
 
-def _procesar_lista(tipo, ids, host, aplicar_calendario):
+def _procesar_lista(tipos, ids, host, aplicar_calendario):
   """Procesa una lista de 'ids' (fechas en modo dia a dia, o un unico label en
-  modo snapshot). Cada id se usa para nombrar los CSV/checkpoints. Un id que
-  falla por causa propia no detiene a los demas; un servidor caido tras la
-  recuperacion aborta los restantes. Devuelve el codigo de salida (0/1)."""
+  modo snapshot) para cada tipo de 'tipos' (p. ej. PORTED y DELETED).
+
+  El orden es POR DIA: para cada id se procesan todos los tipos en el orden dado
+  (PORTED y luego DELETED) antes de pasar al siguiente dia. Asi la portabilidad
+  de un dia queda completa (altas y bajas) antes de avanzar, en vez de correr
+  todos los PORTED del rango y al final todos los DELETED.
+
+  El calendario (domingos/festivos) se evalua una sola vez por dia y, si se
+  omite, se saltan todos los tipos de ese dia. Un (tipo,dia) que falla por causa
+  propia no detiene a los demas; un servidor caido tras la recuperacion aborta
+  todo lo restante. Devuelve el codigo de salida (0/1)."""
   ok = []
   fallidos = []
   omitidos = []
@@ -1007,7 +1015,8 @@ def _procesar_lista(tipo, ids, host, aplicar_calendario):
 
   for i, ident in enumerate(ids):
     # El calendario (domingos/festivos) solo aplica al proceso por fecha, no a
-    # un snapshot del full_sync (que no depende del dia de ejecucion).
+    # un snapshot del full_sync (que no depende del dia de ejecucion). Se evalua
+    # una vez por dia: si se omite, se saltan todos los tipos de ese dia.
     if aplicar_calendario:
       omitir, motivo = dia_a_omitir(ident)
       if omitir:
@@ -1015,32 +1024,38 @@ def _procesar_lista(tipo, ids, host, aplicar_calendario):
         omitidos.append((ident, motivo))
         continue
 
-    try:
-      if procesar_dia(tipo, ident, host):
-        ok.append(ident)
-      else:
-        # Fallo propio (ej. archivo inexistente): se continua con el resto.
-        fallidos.append(ident)
-    except ServidorCaidoError:
-      # El servidor sigue caido tras la recuperacion: no tiene sentido seguir
-      # intentando (y rebooteando) los restantes. Se aborta.
-      servidor_caido = True
-      fallidos.append(ident)
-      no_intentados = ids[i + 1:]
-      print("[ABORTAR] (%s) Servidor caido tras la recuperacion; se abortan los "
-            "%d restante(s)." % (ident, len(no_intentados)), file=sys.stderr)
-      if no_intentados:
-        send_notification(
-          "error",
-          "[Portabilidad] ABORTADO %s" % tipo,
-          "Se aborto porque el equipo remoto sigue caido tras la "
-          "accion correctiva.\n"
-          "Host: %s\nTipo: %s\nUltimo intentado: %s\n"
-          "No intentados (%d): %s\n"
-          "Reanuda cuando el equipo este disponible; los OK ya estan hechos y "
-          "los pendientes conservan su checkpoint.\n"
-          % (host, tipo, ident, len(no_intentados), ", ".join(no_intentados)),
-        )
+    for tipo in tipos:
+      etiqueta = "%s %s" % (tipo, ident)
+      try:
+        if procesar_dia(tipo, ident, host):
+          ok.append(etiqueta)
+        else:
+          # Fallo propio (ej. archivo inexistente): se continua con el resto.
+          fallidos.append(etiqueta)
+      except ServidorCaidoError:
+        # El servidor sigue caido tras la recuperacion: no tiene sentido seguir
+        # intentando (y rebooteando) lo restante. Se aborta todo: los tipos que
+        # falten de este dia y todos los dias siguientes.
+        servidor_caido = True
+        fallidos.append(etiqueta)
+        no_intentados = ["%s %s" % (t, ident) for t in tipos[tipos.index(tipo) + 1:]]
+        no_intentados += ["%s %s" % (t, d) for d in ids[i + 1:] for t in tipos]
+        print("[ABORTAR] (%s) Servidor caido tras la recuperacion; se abortan los "
+              "%d restante(s)." % (etiqueta, len(no_intentados)), file=sys.stderr)
+        if no_intentados:
+          send_notification(
+            "error",
+            "[Portabilidad] ABORTADO",
+            "Se aborto porque el equipo remoto sigue caido tras la "
+            "accion correctiva.\n"
+            "Host: %s\nUltimo intentado: %s\n"
+            "No intentados (%d): %s\n"
+            "Reanuda cuando el equipo este disponible; los OK ya estan hechos y "
+            "los pendientes conservan su checkpoint.\n"
+            % (host, etiqueta, len(no_intentados), ", ".join(no_intentados)),
+          )
+        break
+    if servidor_caido:
       break
 
   print("[RESUMEN] OK: %d | Fallidos: %d | Omitidos: %d | No intentados: %d"
@@ -1056,7 +1071,7 @@ def _procesar_lista(tipo, ids, host, aplicar_calendario):
 
 def run(tipo, date=None, date_from=None, date_to=None, label=None):
   """Punto de entrada reutilizable (lo usan el CLI y full_sync.py). Ejecuta la
-  portabilidad de 'tipo' (PORTED/DELETED) en uno de dos modos:
+  portabilidad de 'tipo' en uno de dos modos:
 
     - Modo FECHA (dia a dia): pasa date o date_from/date_to. Los CSV se llaman
       <PREFIX>_<TYPE>_<fecha>.csv y se omiten domingos/festivos (calendario).
@@ -1064,11 +1079,18 @@ def run(tipo, date=None, date_from=None, date_to=None, label=None):
       <PREFIX>_<TYPE>[_<label>].csv y NO se aplica calendario (un snapshot del
       estado total no depende del dia de ejecucion).
 
+  'tipo' puede ser un string (p. ej. 'PORTED', como lo llama full_sync.py) o una
+  lista/tupla de tipos (p. ej. ['PORTED', 'DELETED'] desde el CLI en modo BOTH).
+  Con varios tipos el orden es POR DIA: se completan todos los tipos de un dia
+  antes de pasar al siguiente.
+
   No se pueden mezclar los dos modos. Devuelve el codigo de salida (0 = OK;
   1 = hubo fallos o se aborto). No llama a sys.exit(): el llamador decide."""
   # Valida que toda la configuracion obligatoria provenga del .env antes de operar.
   validar_configuracion()
   host = socket.gethostname()
+
+  tipos = [tipo] if isinstance(tipo, str) else list(tipo)
 
   modo_fecha = bool(date or date_from or date_to)
   if modo_fecha and label is not None:
@@ -1077,11 +1099,11 @@ def run(tipo, date=None, date_from=None, date_to=None, label=None):
 
   if modo_fecha:
     ids = resolver_fechas(date=date, date_from=date_from, date_to=date_to)
-    return _procesar_lista(tipo, ids, host, aplicar_calendario=True)
+    return _procesar_lista(tipos, ids, host, aplicar_calendario=True)
 
   # Modo snapshot: un unico "id" que es el label (o cadena vacia => <PREFIX>_<TYPE>.csv).
   ident = (label or "").strip()
-  return _procesar_lista(tipo, [ident], host, aplicar_calendario=False)
+  return _procesar_lista(tipos, [ident], host, aplicar_calendario=False)
 
 
 def main(argv=None):
@@ -1122,13 +1144,11 @@ def main(argv=None):
     return 2
 
   try:
-    # En modo BOTH corre ambos aunque el primero falle; el codigo de salida es
-    # el maximo (peor caso) para que el llamador detecte cualquier fallo.
-    rc = 0
-    for t in tipos:
-      rc = max(rc, run(t, date=args.date, date_from=args.date_from,
-                       date_to=args.date_to, label=args.label))
-    return rc
+    # Se pasa la lista completa de tipos a run(): el orden es POR DIA (todos los
+    # tipos de un dia antes de pasar al siguiente), no todos los PORTED del rango
+    # y al final todos los DELETED. run() ya devuelve el peor codigo de salida.
+    return run(tipos, date=args.date, date_from=args.date_from,
+               date_to=args.date_to, label=args.label)
   except ValueError as e:
     print("[ERROR] %s" % e, file=sys.stderr)
     return 2
