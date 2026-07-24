@@ -29,6 +29,21 @@ class ServidorCaidoError(Exception):
   pass
 
 
+class OrigenCaidoError(Exception):
+  """Se lanza cuando el servidor de ORIGEN (SOURCE_HOST) no responde al ping
+  tras agotar el sondeo. Distingue 'servidor de origen caido' de 'archivo aun no
+  generado': en el pre-chequeo del rango, aborta todo (no tiene sentido buscar
+  los CSV de los demas dias si el origen no responde)."""
+  pass
+
+
+class ArchivoOrigenFaltanteError(Exception):
+  """Se lanza cuando el servidor de origen SI responde al ping pero el CSV del
+  dia no existe/no se pudo descargar. Es un fallo por dato faltante, no por
+  servidor caido."""
+  pass
+
+
 # ---------------------------------------------------------------------------
 # Configuracion de notificaciones
 # ---------------------------------------------------------------------------
@@ -89,6 +104,17 @@ SOURCE_PORT = os.environ.get("SOURCE_PORT", "22").strip()
 # Directorio remoto donde vive el CSV en el servidor de origen. El nombre del
 # archivo (<PREFIX>_<TYPE>_<fecha>.csv) se agrega al final.
 SOURCE_PATH = os.environ.get("SOURCE_PATH", "").strip()
+
+# --- Ping al servidor de origen (diagnostico cuando falla la descarga) ---
+# Si la descarga por scp falla o el archivo no aparece, se hace ping a SOURCE_HOST
+# para distinguir dos causas: si NO responde -> el servidor de origen esta caido
+# (alarma distinta); si responde -> el archivo no existe (aun no se genero).
+# El sondeo son SOURCE_PING_TRIES pruebas, una por SOURCE_PING_INTERVAL segundos,
+# cada una enviando SOURCE_PING_COUNT paquetes. Por defecto: 5 pruebas x 1 min x
+# 5 paquetes (~5 min de espera total antes de declarar el servidor caido).
+SOURCE_PING_COUNT = int(os.environ.get("SOURCE_PING_COUNT", "5"))
+SOURCE_PING_TRIES = int(os.environ.get("SOURCE_PING_TRIES", "5"))
+SOURCE_PING_INTERVAL = int(os.environ.get("SOURCE_PING_INTERVAL", "60"))
 
 # Modo debug de la sesion CLI (pexpect) y del scp. Con true:
 #   - duplica TODA la salida del pexpect a la pantalla (ademas del archivo de log
@@ -725,9 +751,21 @@ def ejecutar_parte(tipo, fecha, parte):
 
 
 def dia_a_omitir(fecha_dato):
-  """Decide si se omite el proceso por domingo/festivo. Segun SKIP_CHECK_DATE
-  se evalua la fecha de ejecucion (hoy) o la fecha de los datos (fecha_dato,
-  formato YYYYMMDD/YYYY-MM-DD). Devuelve (True, motivo) o (False, None)."""
+  """Decide si se omite el proceso. Reglas:
+    1. Hoy/futuro: el proceso va un dia atras (el CSV del dia se genera al dia
+       siguiente), asi que nunca se procesa una fecha_dato >= hoy. Esta regla es
+       independiente del calendario (aplica aunque SKIP_SUNDAY/HOLIDAYS esten en
+       false) y siempre mira la fecha del dato.
+    2. Domingo/festivo: segun SKIP_CHECK_DATE se evalua la fecha de ejecucion
+       (hoy) o la fecha de los datos (fecha_dato, formato YYYYMMDD/YYYY-MM-DD).
+  Devuelve (True, motivo) o (False, None)."""
+  # Regla 1: no procesar hoy ni fechas futuras (aun no existe su archivo).
+  f_dato = parse_run_date(fecha_dato)
+  if f_dato is not None and f_dato >= date.today():
+    return True, ("fecha de hoy o futura (%s): el archivo del dia se genera al "
+                  "dia siguiente" % f_dato.isoformat())
+
+  # Regla 2: domingo/festivo.
   if not (SKIP_SUNDAY or SKIP_HOLIDAYS):
     return False, None
 
@@ -766,6 +804,71 @@ def descargar_origen(base, destino_local):
   print("[ORIGEN] Descargado: %s" % destino_local)
 
 
+def origen_responde_ping():
+  """Sondea SOURCE_HOST con ping para saber si el servidor de origen esta vivo.
+
+  Envia SOURCE_PING_TRIES pruebas, una cada SOURCE_PING_INTERVAL segundos, con
+  SOURCE_PING_COUNT paquetes por prueba. Devuelve True en cuanto UNA prueba
+  responde (corta el sondeo); False si ninguna respondio tras agotar las pruebas.
+  """
+  # -c cuenta de paquetes, -w deadline total en segundos (linux). Salida a
+  # /dev/null: solo interesa el codigo de retorno.
+  cmd = "ping -c %d -w %d %s >/dev/null 2>&1" % (
+    SOURCE_PING_COUNT, max(1, SOURCE_PING_COUNT), SOURCE_HOST)
+  for intento in range(1, SOURCE_PING_TRIES + 1):
+    if CLI_DEBUG:
+      print("[CLI_DEBUG] ping (prueba %d/%d): %s" % (intento, SOURCE_PING_TRIES, cmd))
+    if os.system(cmd) == 0:
+      print("[PING] %s respondio en la prueba %d/%d."
+            % (SOURCE_HOST, intento, SOURCE_PING_TRIES))
+      return True
+    print("[PING] %s no respondio (prueba %d/%d)."
+          % (SOURCE_HOST, intento, SOURCE_PING_TRIES), file=sys.stderr)
+    if intento < SOURCE_PING_TRIES:
+      time.sleep(SOURCE_PING_INTERVAL)
+  return False
+
+
+def asegurar_origen(tipo, fecha):
+  """Garantiza que el CSV <PREFIX>_<TYPE>_<fecha>.csv exista en DIRFILES.
+
+  Si no esta local y hay SOURCE_HOST, lo baja por scp. Si la descarga falla o el
+  archivo sigue sin aparecer, hace ping para distinguir la causa y lanza:
+    - OrigenCaidoError          si el servidor de origen no responde al ping.
+    - ArchivoOrigenFaltanteError si responde pero el archivo no existe.
+  Con SOURCE_HOST vacio no hay descarga ni ping: solo valida la existencia local.
+  """
+  base = nombre_base(tipo, fecha)
+  archivo = "%s/%s.csv" % (DIRFILES, base)
+
+  if os.path.isfile(archivo):
+    return archivo
+
+  if SOURCE_HOST:
+    try:
+      descargar_origen(base, archivo)
+    except FileNotFoundError as e:
+      # Fallo la descarga: se hace ping para saber si es servidor caido o archivo
+      # inexistente. El ping puede tardar (hasta ~5 min con los defaults).
+      print("[ORIGEN] Fallo la descarga de %s.csv; se sondea %s por ping..."
+            % (base, SOURCE_HOST))
+      if not origen_responde_ping():
+        raise OrigenCaidoError(
+          "El servidor de origen %s no responde al ping tras %d prueba(s); no se "
+          "pudo obtener %s.csv." % (SOURCE_HOST, SOURCE_PING_TRIES, base)
+        ) from e
+      raise ArchivoOrigenFaltanteError(
+        "El servidor de origen %s responde, pero el archivo %s.csv no existe/no "
+        "se pudo descargar (probablemente aun no se genero)." % (SOURCE_HOST, base)
+      ) from e
+
+  if not os.path.isfile(archivo):
+    raise ArchivoOrigenFaltanteError(
+      "No se encontro el archivo de origen para procesar: %s" % archivo
+    )
+  return archivo
+
+
 def procesar_dia(tipo, fecha, host):
   """Procesa un unico dia (una fecha). Realiza particion en chunks, envio y
   ejecucion remota de cada parte con reintentos/recuperacion/checkpoint, y
@@ -793,17 +896,11 @@ def procesar_dia(tipo, fecha, host):
   total_partes = None
 
   try:
-    # --- Origen: si no esta local y hay SOURCE_HOST, se baja por scp ---
-    # (solo modo fecha; el snapshot de full_sync no entra aqui: se llama con
-    # aplicar_calendario=False y su CSV lo genera full_sync.py).
-    if not os.path.isfile(archivo) and SOURCE_HOST:
-      descargar_origen(base, archivo)
-
-    # --- Validacion: el archivo de origen debe existir ---
-    if not os.path.isfile(archivo):
-      raise FileNotFoundError(
-        "No se encontro el archivo de origen para procesar: %s" % archivo
-      )
+    # --- Origen: descarga por scp si falta y valida existencia (con ping) ---
+    # (solo modo fecha; el snapshot de full_sync no entra aqui). En el modo rango
+    # este archivo ya fue asegurado por el pre-chequeo, asi que aqui suele ser un
+    # no-op. asegurar_origen lanza OrigenCaidoError/ArchivoOrigenFaltanteError.
+    asegurar_origen(tipo, fecha)
 
     # Marca de tiempo para medir cuanto tarda la preparacion (lectura + troceo)
     # antes del primer envio. Ayuda a ubicar retrasos entre la notificacion y el
@@ -875,6 +972,31 @@ def procesar_dia(tipo, fecha, host):
     # Todo OK: se limpia el checkpoint para el proximo run.
     borrar_checkpoint(tipo, fecha)
 
+  except OrigenCaidoError as e:
+    # El servidor de ORIGEN no responde al ping: se notifica y se propaga para
+    # que el rango aborte (no tiene sentido buscar los CSV de los demas dias).
+    send_notification(
+      "error",
+      "[Portabilidad] ERROR (origen caido) %s %s" % (tipo, fecha),
+      "El proceso de portabilidad %s no pudo obtener el archivo de origen: el "
+      "servidor de origen (%s) no responde al ping.\n"
+      "Host: %s\nTipo: %s\nFecha: %s\nDetalle: %s\n"
+      % (FILE_PREFIX, SOURCE_HOST, host, tipo, fecha, e),
+    )
+    print("[ERROR] (%s) ORIGEN CAIDO: %s" % (fecha, e), file=sys.stderr)
+    raise
+  except ArchivoOrigenFaltanteError as e:
+    # El origen responde pero el archivo del dia no existe (aun no se genero):
+    # es un fallo propio del dia, no aborta el rango.
+    send_notification(
+      "error",
+      "[Portabilidad] ERROR (archivo no encontrado) %s %s" % (tipo, fecha),
+      "El proceso de portabilidad %s no encontro el archivo de origen del dia.\n"
+      "Host: %s\nTipo: %s\nFecha: %s\nDetalle: %s\n"
+      % (FILE_PREFIX, host, tipo, fecha, e),
+    )
+    print("[ERROR] (%s) ARCHIVO FALTANTE: %s" % (fecha, e), file=sys.stderr)
+    return False
   except ServidorCaidoError as e:
     # El equipo remoto sigue caido tras la recuperacion: se notifica este dia
     # y se propaga para que el modo rango aborte los dias restantes. Si la causa
@@ -1013,17 +1135,63 @@ def _procesar_lista(tipos, ids, host, aplicar_calendario):
   no_intentados = []
   servidor_caido = False
 
-  for i, ident in enumerate(ids):
-    # El calendario (domingos/festivos) solo aplica al proceso por fecha, no a
-    # un snapshot del full_sync (que no depende del dia de ejecucion). Se evalua
-    # una vez por dia: si se omite, se saltan todos los tipos de ese dia.
+  # --- Filtro de calendario: se resuelven primero los dias a procesar ---
+  # El calendario (domingos/festivos/hoy) solo aplica al proceso por fecha, no a
+  # un snapshot del full_sync. Se evalua una vez por dia: si se omite, se saltan
+  # todos los tipos de ese dia.
+  dias = []
+  for ident in ids:
     if aplicar_calendario:
       omitir, motivo = dia_a_omitir(ident)
       if omitir:
         print("[OMITIDO] (%s) No se ejecuta: %s." % (ident, motivo))
         omitidos.append((ident, motivo))
         continue
+    dias.append(ident)
 
+  # --- Pre-chequeo (solo modo fecha): todos los archivos deben existir ---
+  # Antes de ejecutar nada se asegura que cada (tipo,dia) tenga su CSV (se baja
+  # por scp si hace falta). Si el servidor de origen no responde -> se aborta con
+  # alarma "origen caido". Si responde pero falta algun archivo -> se aborta el
+  # rango completo con una unica alarma listando los faltantes (no se ejecuta
+  # nada a medias). El snapshot (aplicar_calendario=False) no pre-chequea.
+  if aplicar_calendario and SOURCE_HOST:
+    faltantes = []
+    try:
+      for ident in dias:
+        for tipo in tipos:
+          try:
+            asegurar_origen(tipo, ident)
+          except ArchivoOrigenFaltanteError as e:
+            faltantes.append("%s %s" % (tipo, ident))
+            print("[PRECHEQUEO] Falta %s %s: %s" % (tipo, ident, e), file=sys.stderr)
+    except OrigenCaidoError as e:
+      send_notification(
+        "error",
+        "[Portabilidad] ABORTADO (origen caido)",
+        "Se aborto el rango en el pre-chequeo: el servidor de origen (%s) no "
+        "responde al ping.\nHost: %s\nDetalle: %s\n" % (SOURCE_HOST, host, e),
+      )
+      print("[ABORTAR] Origen caido en el pre-chequeo: %s" % e, file=sys.stderr)
+      print("[RESUMEN] OK: 0 | Fallidos: 0 | Omitidos: %d | ABORTADO (origen caido)"
+            % len(omitidos))
+      return 1
+
+    if faltantes:
+      send_notification(
+        "error",
+        "[Portabilidad] ABORTADO (archivos faltantes)",
+        "Se aborto el rango en el pre-chequeo: el servidor de origen responde "
+        "pero faltan %d archivo(s) de origen (no se ejecuta nada a medias).\n"
+        "Host: %s\nFaltantes: %s\n" % (len(faltantes), host, ", ".join(faltantes)),
+      )
+      print("[ABORTAR] Faltan %d archivo(s) de origen: %s"
+            % (len(faltantes), ", ".join(faltantes)), file=sys.stderr)
+      print("[RESUMEN] OK: 0 | Fallidos: %d | Omitidos: %d | ABORTADO (archivos "
+            "faltantes)" % (len(faltantes), len(omitidos)))
+      return 1
+
+  for i, ident in enumerate(dias):
     for tipo in tipos:
       etiqueta = "%s %s" % (tipo, ident)
       try:
@@ -1039,7 +1207,7 @@ def _procesar_lista(tipos, ids, host, aplicar_calendario):
         servidor_caido = True
         fallidos.append(etiqueta)
         no_intentados = ["%s %s" % (t, ident) for t in tipos[tipos.index(tipo) + 1:]]
-        no_intentados += ["%s %s" % (t, d) for d in ids[i + 1:] for t in tipos]
+        no_intentados += ["%s %s" % (t, d) for d in dias[i + 1:] for t in tipos]
         print("[ABORTAR] (%s) Servidor caido tras la recuperacion; se abortan los "
               "%d restante(s)." % (etiqueta, len(no_intentados)), file=sys.stderr)
         if no_intentados:
