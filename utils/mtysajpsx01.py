@@ -76,6 +76,20 @@ SCP_USER = os.environ.get("SCP_USER", "")
 SCP_PORT = os.environ.get("SCP_PORT", "22")
 SCP_DEST_PATH = os.environ.get("SCP_DEST_PATH", "")
 
+# --- 4) SOURCE (pull del CSV diario de origen desde otro servidor) ---
+# En modo fecha (portabilidad diaria/rango), el CSV <PREFIX>_<TYPE>_<fecha>.csv
+# lo produce un tercer servidor (p. ej. 172.21.0.13). Si SOURCE_HOST esta
+# definido y el CSV no esta en DIRFILES, se baja por scp desde ahi antes de
+# trocearlo. Si SOURCE_HOST esta vacio, se conserva el comportamiento previo:
+# el archivo debe existir ya localmente. Solo aplica al modo fecha; el snapshot
+# de full_sync lo genera full_sync.py y no se descarga.
+SOURCE_HOST = os.environ.get("SOURCE_HOST", "").strip()
+SOURCE_USER = os.environ.get("SOURCE_USER", "").strip()
+SOURCE_PORT = os.environ.get("SOURCE_PORT", "22").strip()
+# Directorio remoto donde vive el CSV en el servidor de origen. El nombre del
+# archivo (<PREFIX>_<TYPE>_<fecha>.csv) se agrega al final.
+SOURCE_PATH = os.environ.get("SOURCE_PATH", "").strip()
+
 # Modo debug de la sesion CLI (pexpect) y del scp. Con true:
 #   - duplica TODA la salida del pexpect a la pantalla (ademas del archivo de log
 #     LOG_DIR/<parte>.csv, que se conserva),
@@ -725,6 +739,29 @@ def dia_a_omitir(fecha_dato):
   return dia_omitido(fecha_eval)
 
 
+def descargar_origen(base, destino_local):
+  """Baja por scp el CSV de origen <base>.csv desde SOURCE_HOST a destino_local.
+
+  Solo se llama en modo fecha cuando el archivo no existe localmente y
+  SOURCE_HOST esta configurado. Reutiliza el mismo estilo que el scp de salida:
+  '-P <puerto> -o User=<user>' para forzar el usuario por encima de ~/.ssh/config.
+  Lanza FileNotFoundError si el archivo remoto no existe o el scp falla, para que
+  procesar_dia lo trate como un fallo propio del dia (no aborta el rango)."""
+  remoto = "%s@%s:%s/%s.csv" % (SOURCE_USER, SOURCE_HOST, SOURCE_PATH.rstrip("/"), base)
+  scp_opts = "-P %s -o User=%s" % (SOURCE_PORT, SOURCE_USER)
+  if CLI_DEBUG:
+    print("[CLI_DEBUG] scp %s %s %s" % (scp_opts, remoto, destino_local))
+  print("[ORIGEN] Descargando %s.csv desde %s..." % (base, SOURCE_HOST))
+  rc = os.system("scp %s %s %s" % (scp_opts, remoto, destino_local))
+  if rc != 0 or not os.path.isfile(destino_local):
+    raise FileNotFoundError(
+      "No se pudo descargar el CSV de origen (codigo scp %s) desde %s. "
+      "Verifica que el archivo exista en el servidor de origen y las "
+      "credenciales SOURCE_*." % (rc, remoto)
+    )
+  print("[ORIGEN] Descargado: %s" % destino_local)
+
+
 def procesar_dia(tipo, fecha, host):
   """Procesa un unico dia (una fecha). Realiza particion en chunks, envio y
   ejecucion remota de cada parte con reintentos/recuperacion/checkpoint, y
@@ -752,6 +789,12 @@ def procesar_dia(tipo, fecha, host):
   total_partes = None
 
   try:
+    # --- Origen: si no esta local y hay SOURCE_HOST, se baja por scp ---
+    # (solo modo fecha; el snapshot de full_sync no entra aqui: se llama con
+    # aplicar_calendario=False y su CSV lo genera full_sync.py).
+    if not os.path.isfile(archivo) and SOURCE_HOST:
+      descargar_origen(base, archivo)
+
     # --- Validacion: el archivo de origen debe existir ---
     if not os.path.isfile(archivo):
       raise FileNotFoundError(
