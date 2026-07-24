@@ -144,6 +144,14 @@ LOG_DIR = os.environ.get("LOG_DIR", "")
 # inexistente. Con false se exige que ya existan (falla si falta alguno).
 CREATE_DIRS = env_bool("CREATE_DIRS", True)
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "20000"))
+# Tolerancia (en lineas) permitida entre los 'Result: Ok' del log y las lineas
+# esperadas del archivo en validar_batch(). El EMS puede no volcar al log el
+# 'Result: Ok' final del propio 'execute batch_script' antes de que el 'exit'
+# corte la conexion (EOF), quedando obtenidos = esperados - 1 aunque el batch
+# haya corrido completo. Con VALIDATE_TOLERANCE>=1 esa diferencia no marca fallo
+# (se apoya en la comprobacion del ultimo comando ejecutado para garantizar que
+# el batch llego al final). Default 1.
+VALIDATE_TOLERANCE = int(os.environ.get("VALIDATE_TOLERANCE", "1"))
 SLEEP_BETWEEN = int(os.environ.get("SLEEP_BETWEEN", "120"))
 # Tiempo maximo (segundos) que la sesion CLI espera el prompt del EMS. Cubre
 # sobre todo el 'execute batch_script', donde el EMS procesa los CHUNK_SIZE
@@ -455,8 +463,14 @@ def validar_batch(nombre_parte):
         ultimo_log = m.group(1).strip()
 
   # 1) La cuenta de 'Result: Ok' (con el +1 del execute) debe coincidir con las
-  # lineas del archivo (con el +1 del header).
-  if obtenidos != esperados:
+  # lineas del archivo (con el +1 del header). Se tolera SOLO que FALTEN hasta
+  # VALIDATE_TOLERANCE 'Result: Ok' (obtenidos < esperados): el caso tipico es que
+  # el EMS no alcance a volcar al log el 'Result: Ok' del propio 'execute
+  # batch_script' antes de cortar la conexion tras el 'exit'; el batch corrio
+  # completo (lo confirma la comprobacion #2). Que SOBREN 'Result: Ok'
+  # (obtenidos > esperados) nunca se tolera: es una anomalia, no un corte.
+  faltantes = esperados - obtenidos
+  if faltantes < 0 or faltantes > VALIDATE_TOLERANCE:
     raise RuntimeError(
       "Batch incompleto en %s: %d 'Result: Ok' vs %d lineas del archivo "
       "(header incluido). El EMS no ejecuto todos los comandos (posible corte "
@@ -475,8 +489,16 @@ def validar_batch(nombre_parte):
       "  esperado: %s\n  en log:   %s" % (nombre_parte, ultimo_batch, ultimo_log)
     )
 
-  print("[VALIDACION] %s: %d 'Result: Ok' == %d lineas (header incluido); ultimo comando OK."
-        % (nombre_parte, obtenidos, esperados))
+  # Dentro de tolerancia (diferencia esperada del 'execute') se reporta solo la
+  # cuenta de 'Result: Ok'; la comparacion contra las lineas del archivo solo se
+  # muestra si cuadran exactas, para no confundir con una "diferencia" que no es
+  # fallo.
+  if obtenidos == esperados:
+    print("[VALIDACION] %s: %d 'Result: Ok' == %d lineas (header incluido); ultimo comando OK."
+          % (nombre_parte, obtenidos, esperados))
+  else:
+    print("[VALIDACION] %s: %d 'Result: Ok'; ultimo comando OK."
+          % (nombre_parte, obtenidos))
 
 
 def EXPECT(nombre_parte):
