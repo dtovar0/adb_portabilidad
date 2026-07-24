@@ -151,7 +151,11 @@ RECOVERY_TIMEOUT = int(os.environ.get("RECOVERY_TIMEOUT", "60"))
 SKIP_SUNDAY = env_bool("SKIP_SUNDAY", True)
 SKIP_HOLIDAYS = env_bool("SKIP_HOLIDAYS", True)
 EXTRA_HOLIDAYS = [x.strip() for x in os.environ.get("EXTRA_HOLIDAYS", "").split(",") if x.strip()]
-SKIP_CHECK_DATE = os.environ.get("SKIP_CHECK_DATE", "run").strip().lower()
+# Por defecto 'data': el calendario se evalua contra la FECHA DE CADA DATO, no
+# la de ejecucion. Asi, al procesar un rango (--date-from/--date-to), se omiten
+# los domingos/festivos historicos del propio rango, no solo si HOY lo es. Pon
+# 'run' para volver a evaluar la fecha de ejecucion.
+SKIP_CHECK_DATE = os.environ.get("SKIP_CHECK_DATE", "data").strip().lower()
 
 
 # ---------------------------------------------------------------------------
