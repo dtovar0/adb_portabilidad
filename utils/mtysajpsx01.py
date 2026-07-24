@@ -1044,9 +1044,15 @@ def main(argv=None):
       --date-from YYYYMMDD --date-to YYYYMMDD -> un rango, dia a dia
     Snapshot (diferencias del full_sync, sin fecha):
       --label ETIQUETA  (o sin argumento)  -> <PREFIX>_<TYPE>[_<label>].csv
+
+  --type es opcional y por defecto BOTH: corre PORTED y luego DELETED en la
+  misma invocacion (lo habitual en la portabilidad diaria). Pasa --type PORTED
+  o --type DELETED para acotar a uno solo.
   """
   parser = argparse.ArgumentParser(description='Portabilidad Process')
-  parser.add_argument('--type', type=str, required=True, help='PORTED/DELETED')
+  parser.add_argument('--type', type=str, default='BOTH',
+                      help='PORTED, DELETED o BOTH (ambos). Por defecto BOTH: '
+                           'corre PORTED y luego DELETED en la misma invocacion.')
   parser.add_argument('--date', type=str, help='Fecha unica a procesar (YYYYMMDD)')
   parser.add_argument('--date-from', dest='date_from', type=str,
                       help='Inicio del rango de fechas a procesar (YYYYMMDD)')
@@ -1058,9 +1064,24 @@ def main(argv=None):
 
   args = parser.parse_args(argv)
 
+  tipo = (args.type or '').strip().upper()
+  if tipo == 'BOTH':
+    tipos = ['PORTED', 'DELETED']
+  elif tipo in ('PORTED', 'DELETED'):
+    tipos = [tipo]
+  else:
+    print("[ERROR] --type debe ser PORTED, DELETED o BOTH (recibido: %r)"
+          % args.type, file=sys.stderr)
+    return 2
+
   try:
-    return run(args.type, date=args.date, date_from=args.date_from,
-               date_to=args.date_to, label=args.label)
+    # En modo BOTH corre ambos aunque el primero falle; el codigo de salida es
+    # el maximo (peor caso) para que el llamador detecte cualquier fallo.
+    rc = 0
+    for t in tipos:
+      rc = max(rc, run(t, date=args.date, date_from=args.date_from,
+                       date_to=args.date_to, label=args.label))
+    return rc
   except ValueError as e:
     print("[ERROR] %s" % e, file=sys.stderr)
     return 2
