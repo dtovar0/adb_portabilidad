@@ -24,4 +24,7 @@ next-env.d.ts
 *.tsbuildinfo
 .env.local
 .env.*.local
+
+# === Trabajo temporal/local (mockups, pruebas) ===
+scratchpad/
 # === FIN GITIGNORE ===

@@ -166,6 +166,37 @@ def debug_conexiones():
   print("[DEBUG] ===================================================")
 
 
+def formatear_duracion(segundos):
+  """Duracion legible '1h 23m 45s' (omite las unidades en cero de la izquierda)."""
+  seg = int(round(segundos))
+  h, resto = divmod(seg, 3600)
+  m, s = divmod(resto, 60)
+  if h:
+    return "%dh %02dm %02ds" % (h, m, s)
+  if m:
+    return "%dm %02ds" % (m, s)
+  return "%ds" % s
+
+
+def _resumen_ejecucion(nombre, res):
+  """Devuelve las lineas del resumen para una ejecucion (PORTED o DELETED) a
+  partir del ResultadoRun de mtysajpsx01.run(). 'res' puede ser un ResultadoRun
+  (trae .stats) o, por robustez, un int pelado (sin detalle)."""
+  stats = getattr(res, "stats", None) or {}
+  dias = stats.get("dias") or []
+  # En el snapshot del full_sync solo hay un "dia" (el label) por tipo; se
+  # agregan los contadores por si algun dia hubiera mas de una entrada.
+  partes = sum((d.get("partes_ok") or 0) for d in dias)
+  partes_tot = sum((d.get("partes_total") or 0) for d in dias)
+  intentos = sum((d.get("intentos") or 0) for d in dias)
+  recup = sum((d.get("recuperaciones") or 0) for d in dias)
+  estado = "OK" if int(res) == 0 else "CON ERRORES"
+  if stats.get("abortado"):
+    estado = "ABORTADO (%s)" % stats["abortado"]
+  return ("  Ejecucion %-8s %s | %d/%d parte(s) | %d intento(s) | %d recuperacion(es)"
+          % (nombre + ":", estado, partes, partes_tot, intentos, recup))
+
+
 def formatear_peso(num_bytes):
   """Devuelve un tamano legible (B, KB, MB, GB) a partir de bytes."""
   tam = float(num_bytes)
@@ -709,6 +740,12 @@ def main():
 
   label = (args.label or "").strip()
 
+  # Instante de arranque y acumulador de duraciones por fase para el resumen
+  # final. Cada fase escribe su tiempo aqui; las que no corren (por skip/flags)
+  # simplemente no aparecen.
+  t_inicio = time.monotonic()
+  fases = {}
+
   # Antes que nada: si RUN_AS_USER esta definido, verificar que el proceso corra
   # como ese usuario (p. ej. airflow) y abortar si no. No cambia de usuario.
   verificar_usuario()
@@ -760,6 +797,11 @@ def main():
     prefijos = [""]
     print("[FULL_SYNC] Loteo DESHABILITADO: comparacion en una sola pasada.")
 
+  # Conteos de diferencias generadas. Quedan en None si esta corrida no compara
+  # (SKIP_COMPARE reusa los CSV previos): el resumen los marca como "no calculado".
+  n_ported = None
+  n_deleted = None
+
   # SKIP_COMPARE arranca directo en la ejecucion: se omiten descarga, troceo,
   # comparacion y escritura, reusando los CSV PORTED/DELETED de una corrida previa.
   # No tiene sentido junto a --no-execute (no quedaria nada por hacer).
@@ -797,12 +839,16 @@ def main():
     if SKIP_ABD:
       _reusar_o_error("abd")
     else:
+      t_abd = time.monotonic()
       descargar_abd()
+      fases["Descarga ABD"] = time.monotonic() - t_abd
 
     if SKIP_PSX:
       _reusar_o_error("psx")
     else:
+      t_psx = time.monotonic()
       descargar_psx()
+      fases["Descarga PSX"] = time.monotonic() - t_psx
 
     # 2) Troceo por prefijo (si el loteo esta activo) y comparacion. comparar()
     #    carga solo un lote por lado a la vez (control de memoria).
@@ -810,18 +856,55 @@ def main():
     t_split = time.monotonic()
     split_por_prefijo("abd", prefijos)
     split_por_prefijo("psx", prefijos)
-    print("[FULL_SYNC] Troceo completado en %.1fs." % (time.monotonic() - t_split))
+    fases["Troceo"] = time.monotonic() - t_split
+    print("[FULL_SYNC] Troceo completado en %.1fs." % fases["Troceo"])
 
     print("[FULL_SYNC] === Iniciando COMPARACION (ABD vs PSX) ===")
     t_cmp = time.monotonic()
     lineas_put, lineas_del = comparar(prefijos)
-    print("[FULL_SYNC] Comparacion completada en %.1fs." % (time.monotonic() - t_cmp))
+    fases["Comparacion"] = time.monotonic() - t_cmp
+    print("[FULL_SYNC] Comparacion completada en %.1fs." % fases["Comparacion"])
+    # Conteos de diferencias generadas, para el resumen final.
+    n_ported = len(lineas_put)
+    n_deleted = len(lineas_del)
 
     print("[FULL_SYNC] === Escribiendo CSV de diferencias ===")
     escribir_salida("PORTED", label, lineas_put)
     escribir_salida("DELETED", label, lineas_del)
 
     limpiar_intermedios(prefijos)
+
+  etiqueta = (" [%s]" % label) if label else ""
+
+  def _fmt_diff(n):
+    return "no calculado (reuso de CSV previo)" if n is None else "{:,}".format(n)
+
+  def _imprimir_resumen(estado_txt, lineas_exec, salida):
+    """Arma el resumen final (duracion total y por fase, PORTED/DELETED
+    generados, detalle de ejecucion y resultado), lo imprime a 'salida' con el
+    prefijo de log y lo envia por correo (kind 'summary', gobernado por el toggle
+    NOTIFY_SUMMARY del .env; reusa el mismo canal SMTP/MAIL_TO del proceso)."""
+    total = time.monotonic() - t_inicio
+    # Cuerpo sin prefijo de log: sirve tal cual para el correo.
+    cuerpo = ["===== RESUMEN FULL SYNC%s =====" % etiqueta,
+              "Duracion total:   %s" % formatear_duracion(total)]
+    for nombre in ("Descarga ABD", "Descarga PSX", "Troceo", "Comparacion", "Ejecucion"):
+      if nombre in fases:
+        cuerpo.append("  %-15s %s" % (nombre + ":", formatear_duracion(fases[nombre])))
+    cuerpo.append("Diferencias:      PORTED %s | DELETED %s"
+                  % (_fmt_diff(n_ported), _fmt_diff(n_deleted)))
+    cuerpo += list(lineas_exec)
+    cuerpo.append("Resultado:        %s" % estado_txt)
+    cuerpo.append("===================================")
+
+    print("", file=salida)
+    for linea in cuerpo:
+      print("[FULL_SYNC] %s" % linea, file=salida)
+
+    # Envio por correo del mismo resumen (no aborta el proceso si falla el envio;
+    # send_notification respeta NOTIFY_SUMMARY y solo envia si esta activo).
+    asunto = "[Portabilidad] RESUMEN FULL SYNC%s - %s" % (etiqueta, estado_txt)
+    mtysajpsx01.send_notification("summary", asunto, "\n".join(cuerpo) + "\n")
 
   # 3) Ejecucion de las diferencias contra el equipo (salvo --no-execute).
   #    Reutiliza el pipeline completo de mtysajpsx01 (chunks, reintentos,
@@ -831,22 +914,33 @@ def main():
     print("[FULL_SYNC] Listo (solo generacion). Para ejecutar las diferencias: "
           "python3 mtysajpsx01.py --type PORTED%s  (y --type DELETED%s)"
           % (sufijo, sufijo))
+    _imprimir_resumen("OK (solo generacion, sin ejecutar)", [], sys.stdout)
     return 0
 
+  t_exec = time.monotonic()
+  # emitir_resumen=False: full_sync arma su propio resumen combinado (con las
+  # fases de descarga/troceo/comparacion) abajo; asi no se duplica el correo.
   print("[FULL_SYNC] Ejecutando ALTAS (PORTED) contra el equipo ...")
-  rc_ported = mtysajpsx01.run("PORTED", label=label)
+  rc_ported = mtysajpsx01.run("PORTED", label=label, emitir_resumen=False)
 
   print("[FULL_SYNC] Ejecutando BAJAS (DELETED) contra el equipo ...")
-  rc_deleted = mtysajpsx01.run("DELETED", label=label)
+  rc_deleted = mtysajpsx01.run("DELETED", label=label, emitir_resumen=False)
+  fases["Ejecucion"] = time.monotonic() - t_exec
 
   rc = rc_ported or rc_deleted
-  etiqueta = (" [%s]" % label) if label else ""
+  lineas_exec = [
+    _resumen_ejecucion("PORTED", rc_ported),
+    _resumen_ejecucion("DELETED", rc_deleted),
+  ]
   if rc == 0:
     print("[FULL_SYNC] Full sync%s finalizado correctamente." % etiqueta)
+    _imprimir_resumen("OK (0 fallidos)", lineas_exec, sys.stdout)
   else:
     print("[FULL_SYNC] Full sync%s finalizo con errores "
           "(PORTED=%d, DELETED=%d)." % (etiqueta, rc_ported, rc_deleted),
           file=sys.stderr)
+    _imprimir_resumen("CON ERRORES (PORTED=%d, DELETED=%d)" % (rc_ported, rc_deleted),
+                      lineas_exec, sys.stderr)
   return rc
 
 

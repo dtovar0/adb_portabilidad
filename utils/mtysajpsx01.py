@@ -1,5 +1,6 @@
 import pexpect, argparse, sys, os
 import re
+import shutil
 import time
 import smtplib
 import socket
@@ -29,6 +30,21 @@ class ServidorCaidoError(Exception):
   pass
 
 
+class BatchIncompletoError(RuntimeError):
+  """Se lanza cuando el EMS no ejecuto todos los comandos del batch (corte por
+  timeout/desconexion a mitad del 'execute batch_script').
+
+  Lleva 'comandos_ok': cuantos comandos del batch alcanzaron a reportar
+  'Result: Ok' en el log. Con ese dato, el reintento puede RECORTAR el archivo de
+  la parte desde donde se quedo (ver RESUME_PARTIAL) en vez de reenviar las
+  20.000 lineas completas. Hereda de RuntimeError para no alterar el manejo de
+  errores existente (reintentos/recuperacion lo siguen tratando igual)."""
+
+  def __init__(self, mensaje, comandos_ok=0):
+    super().__init__(mensaje)
+    self.comandos_ok = comandos_ok
+
+
 class OrigenCaidoError(Exception):
   """Se lanza cuando el servidor de ORIGEN (SOURCE_HOST) no responde al ping
   tras agotar el sondeo. Distingue 'servidor de origen caido' de 'archivo aun no
@@ -50,6 +66,10 @@ class ArchivoOrigenFaltanteError(Exception):
 NOTIFY_START = env_bool("NOTIFY_START", True)
 NOTIFY_END = env_bool("NOTIFY_END", True)
 NOTIFY_ERROR = env_bool("NOTIFY_ERROR", True)
+# Envio por correo del resumen final del full_sync (duracion, PORTED/DELETED,
+# partes, intentos, recuperaciones). Reusa el mismo canal SMTP/MAIL_TO. Se puede
+# apagar sin tocar las demas notificaciones.
+NOTIFY_SUMMARY = env_bool("NOTIFY_SUMMARY", True)
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "localhost")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "25"))
@@ -152,6 +172,26 @@ CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "20000"))
 # (se apoya en la comprobacion del ultimo comando ejecutado para garantizar que
 # el batch llego al final). Default 1.
 VALIDATE_TOLERANCE = int(os.environ.get("VALIDATE_TOLERANCE", "1"))
+
+# ---------------------------------------------------------------------------
+# Reanudacion DENTRO de una parte (recorte del batch en el reintento)
+# ---------------------------------------------------------------------------
+# Con true (default), cuando una parte falla por 'batch incompleto' (el EMS
+# ejecuto N de los M comandos y se corto), el reintento NO reenvia las M lineas:
+# recorta el archivo de la parte para mandar solo lo que falta, desde el comando
+# N+1 hacia atras RESUME_TOLERANCE lineas. Con false se reenvia siempre la parte
+# completa (comportamiento anterior).
+RESUME_PARTIAL = env_bool("RESUME_PARTIAL", True)
+# Cuantas lineas RETROCEDER respecto del ultimo comando confirmado antes de
+# recortar. Los comandos son put/delete idempotentes, asi que repetir unas
+# cuantas no hace dano y cubre el caso de que el ultimo 'Result: Ok' se haya
+# escrito en el log sin que el comando llegara a aplicarse del todo. Sube este
+# valor (10, 100...) si quieres empezar mas atras. Default 10.
+RESUME_TOLERANCE = int(os.environ.get("RESUME_TOLERANCE", "10"))
+# Minimo de lineas restantes para que valga la pena recortar. Si faltan menos que
+# esto, se reenvia la parte completa (no se gana nada recortando). Default 1.
+RESUME_MIN_LINEAS = int(os.environ.get("RESUME_MIN_LINEAS", "1"))
+
 SLEEP_BETWEEN = int(os.environ.get("SLEEP_BETWEEN", "120"))
 # Tiempo maximo (segundos) que la sesion CLI espera el prompt del EMS. Cubre
 # sobre todo el 'execute batch_script', donde el EMS procesa los CHUNK_SIZE
@@ -215,7 +255,7 @@ def validar_configuracion():
   faltantes = [nombre for nombre, valor in requeridas.items() if not str(valor).strip()]
 
   # Si las notificaciones estan activas, tambien se requiere el correo.
-  if NOTIFY_START or NOTIFY_END or NOTIFY_ERROR:
+  if NOTIFY_START or NOTIFY_END or NOTIFY_ERROR or NOTIFY_SUMMARY:
     if not MAIL_FROM.strip():
       faltantes.append("MAIL_FROM")
     if not MAIL_TO:
@@ -267,8 +307,9 @@ def asegurar_directorios():
 
 def send_notification(kind, subject, body):
   """Envia una notificacion por correo segun el toggle correspondiente.
-  kind: 'start' | 'end' | 'error'. No aborta el proceso si falla el envio."""
-  enabled = {"start": NOTIFY_START, "end": NOTIFY_END, "error": NOTIFY_ERROR}.get(kind, True)
+  kind: 'start' | 'end' | 'error' | 'summary'. No aborta el proceso si falla el envio."""
+  enabled = {"start": NOTIFY_START, "end": NOTIFY_END, "error": NOTIFY_ERROR,
+             "summary": NOTIFY_SUMMARY}.get(kind, True)
   if not enabled:
     print("[NOTIFICACION] Deshabilitada (%s): %s" % (kind, subject))
     return
@@ -416,6 +457,89 @@ def extract_lines(input_file, output_file, start_line, end_line):
         outfile.write(lines[i])
 
 
+def recortar_parte(nombre_parte, comandos_ok):
+  """Recorta el archivo de la parte para reenviar SOLO los comandos que faltan.
+
+  'comandos_ok' es cuantos comandos confirmo el EMS ('Result: Ok' en el log). Se
+  reescribe el archivo con el header '?EMS::CLI?' + los comandos desde
+  comandos_ok - RESUME_TOLERANCE en adelante, de modo que se repitan las ultimas
+  RESUME_TOLERANCE lineas ya aplicadas (put/delete son idempotentes) y no quede
+  hueco si el ultimo 'Result: Ok' se logueo sin aplicarse del todo.
+
+  El ORIGINAL se respalda como <parte>.csv.full la primera vez que se recorta, y
+  los recortes posteriores se calculan SIEMPRE contra ese original: asi, si el
+  segundo intento tambien se corta, los indices siguen refiriendose a la misma
+  numeracion de comandos y no se acumulan recortes sobre recortes.
+
+  Devuelve el numero de lineas de comando que quedaron por enviar, o None si no
+  se recorto (nada que ganar / datos insuficientes), caso en el que el archivo se
+  deja intacto para reenviarlo completo."""
+  ruta = "%s/%s.csv" % (DIRFILES, nombre_parte)
+  respaldo = "%s.full" % ruta
+
+  # El original es el respaldo si ya hubo un recorte previo; si no, el archivo tal
+  # como esta (que en ese momento aun es el completo).
+  origen = respaldo if os.path.isfile(respaldo) else ruta
+  with open(origen, "r") as f:
+    lineas = f.readlines()
+
+  # Se separa el header de los comandos: 'comandos_ok' cuenta COMANDOS, no lineas
+  # del archivo, y el header no genera comando.
+  if lineas and lineas[0].strip() == "?EMS::CLI?":
+    comandos = lineas[1:]
+  else:
+    comandos = lineas
+
+  total = len(comandos)
+  # Indice (0-based) del primer comando a reenviar: se salta lo confirmado y se
+  # retrocede la tolerancia configurada. Nunca antes del primer comando.
+  inicio = max(0, comandos_ok - RESUME_TOLERANCE)
+  restantes = total - inicio
+
+  # Sin nada que recortar (o recorte que no ahorra nada): se deja el archivo como
+  # esta y se reenvia completo.
+  if comandos_ok <= 0 or inicio <= 0 or restantes < RESUME_MIN_LINEAS:
+    print("[REANUDAR-PARTE] %s: no se recorta (comandos_ok=%d, inicio=%d, "
+          "restantes=%d); se reenvia la parte completa."
+          % (nombre_parte, comandos_ok, inicio, restantes), file=sys.stderr)
+    return None
+
+  # Respaldo del original solo la primera vez (para no sobreescribirlo con un
+  # archivo ya recortado en el segundo intento).
+  if not os.path.isfile(respaldo):
+    shutil.copyfile(ruta, respaldo)
+
+  with open(ruta, "w") as f:
+    # El header es obligatorio en TODA parte que se envie: el equipo rechaza el
+    # batch_script si la primera linea no es '?EMS::CLI?'.
+    f.write("?EMS::CLI?\n")
+    f.writelines(comandos[inicio:])
+
+  print("[REANUDAR-PARTE] %s: el EMS confirmo %d de %d comando(s); se reenvian "
+        "los ultimos %d (desde el comando %d, retrocediendo RESUME_TOLERANCE=%d). "
+        "Original respaldado en %s."
+        % (nombre_parte, comandos_ok, total, restantes, inicio + 1,
+           RESUME_TOLERANCE, os.path.basename(respaldo)))
+  return restantes
+
+
+def restaurar_parte(nombre_parte):
+  """Restaura el archivo completo de la parte desde el respaldo .full, si existe.
+
+  Se llama al terminar con la parte (con exito o tras agotar todo) para que en
+  disco quede siempre el batch completo y una corrida posterior de la misma fecha
+  no reenvie por error solo el trozo recortado."""
+  ruta = "%s/%s.csv" % (DIRFILES, nombre_parte)
+  respaldo = "%s.full" % ruta
+  if not os.path.isfile(respaldo):
+    return
+  try:
+    os.replace(respaldo, ruta)
+  except OSError as e:
+    print("[REANUDAR-PARTE] No se pudo restaurar %s desde el respaldo: %s"
+          % (ruta, e), file=sys.stderr)
+
+
 def validar_batch(nombre_parte):
   """Valida que el EMS ejecuto TODOS los comandos del batch, leyendo el logfile
   ya cerrado en disco (LOG_DIR/<parte>.csv) en vez de mantenerlo en memoria.
@@ -471,10 +595,18 @@ def validar_batch(nombre_parte):
   # (obtenidos > esperados) nunca se tolera: es una anomalia, no un corte.
   faltantes = esperados - obtenidos
   if faltantes < 0 or faltantes > VALIDATE_TOLERANCE:
-    raise RuntimeError(
+    # 'comandos_ok' = comandos del batch que SI se ejecutaron, para que el
+    # reintento pueda recortar el archivo desde ahi. En un batch cortado el
+    # 'execute batch_script' nunca llego a emitir su 'Result: Ok' final, asi que
+    # los 'obtenidos' corresponden 1:1 a comandos put/delete completados. Si
+    # SOBRARAN oks (faltantes < 0) el conteo no es fiable: se manda 0 para que el
+    # reintento reenvie la parte completa.
+    comandos_ok = obtenidos if faltantes > 0 else 0
+    raise BatchIncompletoError(
       "Batch incompleto en %s: %d 'Result: Ok' vs %d lineas del archivo "
       "(header incluido). El EMS no ejecuto todos los comandos (posible corte "
-      "antes del final)." % (nombre_parte, obtenidos, esperados)
+      "antes del final)." % (nombre_parte, obtenidos, esperados),
+      comandos_ok=comandos_ok,
     )
 
   # 2) El ultimo comando ejecutado debe ser el ultimo comando del batch.
@@ -684,9 +816,13 @@ def accion_correctiva():
   return True
 
 
-def _intentar_parte_una_tanda(tipo, fecha, parte):
+def _intentar_parte_una_tanda(tipo, fecha, parte, contador=None):
   """Intenta enviar+ejecutar la parte hasta SSH_RETRIES reintentos.
-  Devuelve None si tuvo exito, o la ultima excepcion si agoto los reintentos."""
+  Devuelve None si tuvo exito, o la ultima excepcion si agoto los reintentos.
+
+  'contador' es un dict opcional {'intentos': int} que se incrementa por cada
+  intento de scp+ejecucion realizado, para que quien orquesta pueda reportar
+  cuantos intentos costo la corrida (incluye los reintentos)."""
   nombre_parte = "%s_%s" % (nombre_base(tipo, fecha), parte)
   origen = f"{DIRFILES}/{nombre_parte}.csv"
 
@@ -704,6 +840,8 @@ def _intentar_parte_una_tanda(tipo, fecha, parte):
   ultima_exc = None
   while intento <= SSH_RETRIES:
     intento += 1
+    if contador is not None:
+      contador["intentos"] = contador.get("intentos", 0) + 1
     try:
       # Validacion del scp: os.system devuelve el estado de salida; !=0 es fallo.
       if CLI_DEBUG:
@@ -721,6 +859,17 @@ def _intentar_parte_una_tanda(tipo, fecha, parte):
     except Exception as e:
       ultima_exc = e
       if intento <= SSH_RETRIES:
+        # Si el batch se corto a mitad y sabemos hasta donde llego, se recorta el
+        # archivo para que el reintento mande SOLO lo que falta (mucho mas rapido
+        # que reenviar las 20k lineas). Cualquier fallo al recortar no debe tumbar
+        # el reintento: se avisa y se reenvia la parte completa.
+        if RESUME_PARTIAL and isinstance(e, BatchIncompletoError):
+          try:
+            recortar_parte(nombre_parte, e.comandos_ok)
+          except Exception as e_rec:
+            print("[REANUDAR-PARTE] Fallo el recorte de %s (%s: %s); se reenvia "
+                  "la parte completa."
+                  % (nombre_parte, type(e_rec).__name__, e_rec), file=sys.stderr)
         print("[REINTENTO] Parte %d fallo (intento %d/%d): %s: %s. "
               "Reintentando en %ds..."
               % (parte, intento, SSH_RETRIES + 1, type(e).__name__, e, RETRY_SLEEP),
@@ -729,17 +878,32 @@ def _intentar_parte_una_tanda(tipo, fecha, parte):
   return ultima_exc
 
 
-def ejecutar_parte(tipo, fecha, parte):
+def ejecutar_parte(tipo, fecha, parte, contador=None):
   """Envia por scp la parte y ejecuta el batch_script remoto, con reintentos.
   Si la conexion se reinicia, reintenta la MISMA parte hasta SSH_RETRIES veces.
 
   Si se agotan los reintentos y RECOVERY_ENABLED=true, se ejecuta la accion
   correctiva (ej. reboot remoto), se espera RECOVERY_WAIT segundos y se vuelve
   a intentar la parte con otra tanda completa de reintentos. Esto se repite
-  hasta RECOVERY_MAX_CYCLES veces antes de abortar definitivamente."""
+  hasta RECOVERY_MAX_CYCLES veces antes de abortar definitivamente.
+
+  'contador' es un dict opcional que se acumula para el resumen: 'intentos'
+  (total de intentos de scp+ejecucion, incluye reintentos) y 'recuperaciones'
+  (ciclos de accion correctiva/reboot disparados)."""
+  try:
+    _ejecutar_parte_con_recuperacion(tipo, fecha, parte, contador)
+  finally:
+    # Con exito o con fallo: si el archivo quedo recortado por la reanudacion
+    # parcial, se restaura el batch completo en disco. Asi una corrida posterior
+    # de la misma fecha no reenvia por error solo el ultimo trozo.
+    restaurar_parte("%s_%s" % (nombre_base(tipo, fecha), parte))
+
+
+def _ejecutar_parte_con_recuperacion(tipo, fecha, parte, contador=None):
+  """Cuerpo de ejecutar_parte(): tandas de reintentos + ciclos de recuperacion."""
   ciclo = 0
   while True:
-    exc = _intentar_parte_una_tanda(tipo, fecha, parte)
+    exc = _intentar_parte_una_tanda(tipo, fecha, parte, contador)
     if exc is None:
       return  # exito
 
@@ -762,6 +926,8 @@ def ejecutar_parte(tipo, fecha, parte):
       ) from exc
 
     ciclo += 1
+    if contador is not None:
+      contador["recuperaciones"] = contador.get("recuperaciones", 0) + 1
     print("[RECUPERACION] Parte %d agoto los reintentos; disparando accion "
           "correctiva (ciclo %d/%d)." % (parte, ciclo, RECOVERY_MAX_CYCLES),
           file=sys.stderr)
@@ -896,9 +1062,10 @@ def procesar_dia(tipo, fecha, host):
   ejecucion remota de cada parte con reintentos/recuperacion/checkpoint, y
   las notificaciones de inicio/fin/error correspondientes a ese dia.
 
-  Devuelve True si el dia se completo correctamente, False si fallo por una
-  causa propia de ese dia (ej. archivo inexistente): el orquestador de rango
-  puede continuar con los dias siguientes.
+  Devuelve un dict de estadisticas del dia (ver _stats_dia); stats["ok"] es
+  True si el dia se completo correctamente y False si fallo por una causa
+  propia de ese dia (ej. archivo inexistente): el orquestador de rango puede
+  continuar con los dias siguientes.
 
   Propaga ServidorCaidoError si el equipo remoto agoto reintentos y ciclos de
   recuperacion: en ese caso el orquestador debe abortar el rango (no tiene
@@ -916,6 +1083,25 @@ def procesar_dia(tipo, fecha, host):
 
   comandos_ok = 0
   total_partes = None
+  total_lineas = 0
+  # Contadores que acumula ejecutar_parte(): intentos totales de scp+ejecucion
+  # (incluye reintentos) y ciclos de recuperacion (reboot) disparados.
+  contador = {"intentos": 0, "recuperaciones": 0}
+  t_dia = time.monotonic()
+
+  def _stats(ok):
+    """Arma el dict de estadisticas del dia para el resumen del orquestador."""
+    return {
+      "ok": ok,
+      "tipo": tipo,
+      "fecha": fecha,
+      "comandos": total_lineas,        # lineas del CSV (put/delete ejecutados)
+      "partes_ok": comandos_ok,        # partes/chunks completadas
+      "partes_total": total_partes,    # partes/chunks totales del dia
+      "intentos": contador["intentos"],
+      "recuperaciones": contador["recuperaciones"],
+      "duracion": time.monotonic() - t_dia,
+    }
 
   try:
     # --- Origen: descarga por scp si falta y valida existencia (con ping) ---
@@ -972,7 +1158,7 @@ def procesar_dia(tipo, fecha, host):
         continue
 
       # Envio + ejecucion remota con reintentos/recuperacion ante fallo.
-      ejecutar_parte(tipo, fecha, check)
+      ejecutar_parte(tipo, fecha, check, contador)
 
       # Solo se marca/cuenta cuando la parte se completo realmente.
       marcar_parte_completada(tipo, fecha, check)
@@ -1018,7 +1204,7 @@ def procesar_dia(tipo, fecha, host):
       % (FILE_PREFIX, host, tipo, fecha, e),
     )
     print("[ERROR] (%s) ARCHIVO FALTANTE: %s" % (fecha, e), file=sys.stderr)
-    return False
+    return _stats(False)
   except ServidorCaidoError as e:
     # El equipo remoto sigue caido tras la recuperacion: se notifica este dia
     # y se propaga para que el modo rango aborte los dias restantes. Si la causa
@@ -1059,7 +1245,7 @@ def procesar_dia(tipo, fecha, host):
         % (FILE_PREFIX, CLI_TIMEOUT, host, tipo, fecha, comandos_ok, total_partes, to),
       )
       print("[ERROR] (%s) CLI_TIMEOUT agotado: %s" % (fecha, to), file=sys.stderr)
-      return False
+      return _stats(False)
 
     send_notification(
       "error",
@@ -1071,7 +1257,7 @@ def procesar_dia(tipo, fecha, host):
       % (FILE_PREFIX, host, tipo, fecha, type(e).__name__, comandos_ok, total_partes, e),
     )
     print("[ERROR] (%s) %s: %s" % (fecha, type(e).__name__, e), file=sys.stderr)
-    return False
+    return _stats(False)
 
   send_notification(
     "end",
@@ -1082,7 +1268,7 @@ def procesar_dia(tipo, fecha, host):
     % (FILE_PREFIX, host, tipo, fecha, comandos_ok, total_partes),
   )
   print("[INFO] (%s) Proceso del dia finalizado correctamente." % fecha)
-  return True
+  return _stats(True)
 
 
 def rango_de_fechas(desde, hasta):
@@ -1138,9 +1324,76 @@ def resolver_fechas(date=None, date_from=None, date_to=None):
   raise ValueError("Debes indicar date, o bien date_from y date_to.")
 
 
-def _procesar_lista(tipos, ids, host, aplicar_calendario):
+class ResultadoRun(int):
+  """Codigo de salida (0/1) que ademas transporta las estadisticas de la corrida.
+
+  Subclasea int para no romper a ningun llamador: sigue funcionando como
+  'rc == 0', 'rc_a or rc_b' y 'sys.exit(rc)'. El atributo .stats trae el detalle
+  por (tipo,dia) y los contadores del resumen, que usa full_sync para imprimir
+  duracion, PORTED/DELETED, partes, intentos y recuperaciones."""
+  def __new__(cls, codigo, stats=None):
+    obj = super().__new__(cls, codigo)
+    obj.stats = stats or {}
+    return obj
+
+
+def formatear_duracion(segundos):
+  """Duracion legible '1h 23m 45s' (omite las unidades en cero de la izquierda)."""
+  seg = int(round(segundos))
+  h, resto = divmod(seg, 3600)
+  m, s = divmod(resto, 60)
+  if h:
+    return "%dh %02dm %02ds" % (h, m, s)
+  if m:
+    return "%dm %02ds" % (m, s)
+  return "%ds" % s
+
+
+def _resumen_lista(titulo, stats_dias, ok, fallidos, omitidos, no_intentados,
+                   abortado, duracion_total):
+  """Arma el resumen de una corrida (diario o snapshot), lo imprime con prefijo
+  [RESUMEN] y lo envia por correo (kind 'summary', gobernado por NOTIFY_SUMMARY;
+  reusa el mismo canal SMTP/MAIL_TO del proceso). No aborta si el envio falla.
+
+  Sirve tanto para el proceso DIARIO (que ejecuta mtysajpsx01 directamente, un
+  (tipo,dia) por entrada de stats_dias) como para el SNAPSHOT del full_sync.
+  El bloque detalla, por cada (tipo,dia): comandos, partes, intentos y ciclos de
+  recuperacion; y un consolidado OK/Fallidos/Omitidos/No intentados."""
+  estado = "OK" if not (fallidos or no_intentados or abortado) else "CON ERRORES"
+  if abortado:
+    estado = "ABORTADO (%s)" % abortado
+
+  cuerpo = ["===== RESUMEN %s =====" % titulo,
+            "Duracion total:   %s" % formatear_duracion(duracion_total)]
+  for d in stats_dias:
+    estado_dia = "OK" if d.get("ok") else "FALLO"
+    cuerpo.append(
+      "  %s %s: %s | %s comando(s) | %s/%s parte(s) | %d intento(s) | %d recuperacion(es) | %s"
+      % (d.get("tipo"), d.get("fecha"), estado_dia,
+         "{:,}".format(d.get("comandos") or 0),
+         d.get("partes_ok") or 0, d.get("partes_total") or 0,
+         d.get("intentos") or 0, d.get("recuperaciones") or 0,
+         formatear_duracion(d.get("duracion") or 0)))
+  cuerpo.append("Consolidado:      OK %d | Fallidos %d | Omitidos %d | No intentados %d"
+                % (ok, fallidos, omitidos, no_intentados))
+  cuerpo.append("Resultado:        %s" % estado)
+  cuerpo.append("=" * (len("===== RESUMEN %s =====" % titulo)))
+
+  for linea in cuerpo:
+    print("[RESUMEN] %s" % linea)
+
+  asunto = "[Portabilidad] RESUMEN %s - %s" % (titulo, estado)
+  send_notification("summary", asunto, "\n".join(cuerpo) + "\n")
+
+
+def _procesar_lista(tipos, ids, host, aplicar_calendario, emitir_resumen=True):
   """Procesa una lista de 'ids' (fechas en modo dia a dia, o un unico label en
   modo snapshot) para cada tipo de 'tipos' (p. ej. PORTED y DELETED).
+
+  Con emitir_resumen=True imprime/envia el resumen consolidado de esta corrida
+  (el default: lo usa el proceso DIARIO). full_sync lo pone en False porque el
+  full_sync llama a run() una vez por tipo y arma su PROPIO resumen combinado
+  (con las fases de descarga/troceo/comparacion), de modo que no se dupliquen.
 
   El orden es POR DIA: para cada id se procesan todos los tipos en el orden dado
   (PORTED y luego DELETED) antes de pasar al siguiente dia. Asi la portabilidad
@@ -1156,6 +1409,12 @@ def _procesar_lista(tipos, ids, host, aplicar_calendario):
   omitidos = []
   no_intentados = []
   servidor_caido = False
+  # Instante de arranque para la duracion total del resumen. El titulo distingue
+  # el proceso DIARIO (por fecha) del SNAPSHOT del full_sync.
+  t0 = time.monotonic()
+  titulo = "PORTABILIDAD DIARIA" if aplicar_calendario else "FULL SYNC"
+  # Estadisticas por (tipo,dia) procesado, para el resumen final del full_sync.
+  stats_dias = []
 
   # --- Filtro de calendario: se resuelven primero los dias a procesar ---
   # El calendario (domingos/festivos/hoy) solo aplica al proceso por fecha, no a
@@ -1195,9 +1454,12 @@ def _procesar_lista(tipos, ids, host, aplicar_calendario):
         "responde al ping.\nHost: %s\nDetalle: %s\n" % (SOURCE_HOST, host, e),
       )
       print("[ABORTAR] Origen caido en el pre-chequeo: %s" % e, file=sys.stderr)
-      print("[RESUMEN] OK: 0 | Fallidos: 0 | Omitidos: %d | ABORTADO (origen caido)"
-            % len(omitidos))
-      return 1
+      if emitir_resumen:
+        _resumen_lista(titulo, [], 0, 0, len(omitidos), 0,
+                       "origen caido", time.monotonic() - t0)
+      return ResultadoRun(1, {"dias": [], "ok": 0, "fallidos": 0,
+                              "omitidos": len(omitidos), "no_intentados": 0,
+                              "abortado": "origen caido"})
 
     if faltantes:
       send_notification(
@@ -1209,15 +1471,20 @@ def _procesar_lista(tipos, ids, host, aplicar_calendario):
       )
       print("[ABORTAR] Faltan %d archivo(s) de origen: %s"
             % (len(faltantes), ", ".join(faltantes)), file=sys.stderr)
-      print("[RESUMEN] OK: 0 | Fallidos: %d | Omitidos: %d | ABORTADO (archivos "
-            "faltantes)" % (len(faltantes), len(omitidos)))
-      return 1
+      if emitir_resumen:
+        _resumen_lista(titulo, [], 0, len(faltantes), len(omitidos), 0,
+                       "archivos faltantes", time.monotonic() - t0)
+      return ResultadoRun(1, {"dias": [], "ok": 0, "fallidos": len(faltantes),
+                              "omitidos": len(omitidos), "no_intentados": 0,
+                              "abortado": "archivos faltantes"})
 
   for i, ident in enumerate(dias):
     for tipo in tipos:
       etiqueta = "%s %s" % (tipo, ident)
       try:
-        if procesar_dia(tipo, ident, host):
+        st = procesar_dia(tipo, ident, host)
+        stats_dias.append(st)
+        if st["ok"]:
           ok.append(etiqueta)
         else:
           # Fallo propio (ej. archivo inexistente): se continua con el resto.
@@ -1248,18 +1515,32 @@ def _procesar_lista(tipos, ids, host, aplicar_calendario):
     if servidor_caido:
       break
 
-  print("[RESUMEN] OK: %d | Fallidos: %d | Omitidos: %d | No intentados: %d"
-        % (len(ok), len(fallidos), len(omitidos), len(no_intentados)))
+  if emitir_resumen:
+    _resumen_lista(titulo, stats_dias, len(ok), len(fallidos), len(omitidos),
+                   len(no_intentados),
+                   "servidor caido" if servidor_caido else None,
+                   time.monotonic() - t0)
+  # Detalle a stderr de que (tipo,dia) fallaron / no se intentaron (no va en el
+  # bloque del resumen, que es un consolidado).
   if fallidos:
     print("[RESUMEN] Fallidos: %s" % ", ".join(fallidos), file=sys.stderr)
   if servidor_caido:
     print("[RESUMEN] ABORTADO por servidor caido. No intentados: %s"
           % ", ".join(no_intentados), file=sys.stderr)
 
-  return 1 if (fallidos or servidor_caido) else 0
+  codigo = 1 if (fallidos or servidor_caido) else 0
+  return ResultadoRun(codigo, {
+    "dias": stats_dias,
+    "ok": len(ok),
+    "fallidos": len(fallidos),
+    "omitidos": len(omitidos),
+    "no_intentados": len(no_intentados),
+    "abortado": "servidor caido" if servidor_caido else None,
+  })
 
 
-def run(tipo, date=None, date_from=None, date_to=None, label=None):
+def run(tipo, date=None, date_from=None, date_to=None, label=None,
+        emitir_resumen=True):
   """Punto de entrada reutilizable (lo usan el CLI y full_sync.py). Ejecuta la
   portabilidad de 'tipo' en uno de dos modos:
 
@@ -1273,6 +1554,9 @@ def run(tipo, date=None, date_from=None, date_to=None, label=None):
   lista/tupla de tipos (p. ej. ['PORTED', 'DELETED'] desde el CLI en modo BOTH).
   Con varios tipos el orden es POR DIA: se completan todos los tipos de un dia
   antes de pasar al siguiente.
+
+  emitir_resumen=False lo usa full_sync (que arma su propio resumen combinado
+  llamando a run() una vez por tipo); el CLI diario lo deja en True.
 
   No se pueden mezclar los dos modos. Devuelve el codigo de salida (0 = OK;
   1 = hubo fallos o se aborto). No llama a sys.exit(): el llamador decide."""
@@ -1289,11 +1573,13 @@ def run(tipo, date=None, date_from=None, date_to=None, label=None):
 
   if modo_fecha:
     ids = resolver_fechas(date=date, date_from=date_from, date_to=date_to)
-    return _procesar_lista(tipos, ids, host, aplicar_calendario=True)
+    return _procesar_lista(tipos, ids, host, aplicar_calendario=True,
+                           emitir_resumen=emitir_resumen)
 
   # Modo snapshot: un unico "id" que es el label (o cadena vacia => <PREFIX>_<TYPE>.csv).
   ident = (label or "").strip()
-  return _procesar_lista(tipos, [ident], host, aplicar_calendario=False)
+  return _procesar_lista(tipos, [ident], host, aplicar_calendario=False,
+                         emitir_resumen=emitir_resumen)
 
 
 def main(argv=None):
