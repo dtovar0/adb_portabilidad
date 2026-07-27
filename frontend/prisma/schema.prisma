@@ -11,7 +11,7 @@ datasource db {
   // Prisma NO admite env() en 'provider' (debe ser literal). El motor se controla
   // con DB_PROVIDER via el script `npm run db:provider`, que reescribe esta linea
   // ("postgresql" o "mysql") antes de generar/migrar. No editar a mano.
-  provider = "postgresql"
+  provider = "mysql"
   url      = env("DATABASE_URL")
 }
 

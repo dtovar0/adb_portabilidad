@@ -41,16 +41,16 @@ export default async function OperatorPage({
   }));
 
   return (
-    <main className="container">
-      <header style={{ marginBottom: 20 }}>
+    <>
+      <div className="page-head">
         <Link href="/" className="muted" style={{ fontSize: 13, textDecoration: "none" }}>
-          ← Volver al dashboard
+          ← Volver al panel
         </Link>
-        <h1 style={{ fontSize: 24, marginTop: 8 }}>Operador {operator}</h1>
-        <p className="secondary" style={{ marginTop: 6, fontSize: 15 }}>
+        <h1 style={{ fontSize: 22, marginTop: 8 }}>Operador {operator}</h1>
+        <p className="secondary" style={{ marginTop: 4, fontSize: 13.5 }}>
           Comportamiento de la portabilidad para este operador.
         </p>
-      </header>
+      </div>
 
       <section
         className="grid"
@@ -74,13 +74,13 @@ export default async function OperatorPage({
 
       <section
         className="grid"
-        style={{ gridTemplateColumns: "1.4fr 1fr", marginTop: 16, alignItems: "start" }}
+        style={{ gridTemplateColumns: "1.4fr 1fr", alignItems: "start" }}
       >
         <Choropleth geo={geo as any} counts={stateCounts} nameKey="name" nameMap={GEO_TO_DATA} />
         <BarList items={stateItems} title={`Top estados — ${operator}`} unit="números" />
       </section>
 
-      <section className="card" style={{ marginTop: 16 }}>
+      <section className="card">
         <h3 style={{ fontSize: 15 }}>Otros operadores</h3>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
           {operators
@@ -104,6 +104,6 @@ export default async function OperatorPage({
             ))}
         </div>
       </section>
-    </main>
+    </>
   );
 }

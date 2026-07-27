@@ -23,6 +23,30 @@ const CAT = ["--c1", "--c2", "--c3", "--c4", "--c5", "--c6", "--c7", "--c8"];
 // El GeoJSON usa "México" para lo que en los datos es "Estado de México".
 const GEO_TO_DATA: Record<string, string> = { México: "Estado de México" };
 
+// Iconos de los KPIs (stroke, heredan color del contenedor).
+const ico = (d: React.ReactNode) => (
+  <svg viewBox="0 0 24 24" width={16} height={16} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+    {d}
+  </svg>
+);
+const ICONS = {
+  phone: ico(<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2 4.2 2 2 0 0 1 4 2h3a2 2 0 0 1 2 1.7c.1.9.3 1.8.6 2.6a2 2 0 0 1-.4 2.1L8 9.6a16 16 0 0 0 6 6l1.2-1.2a2 2 0 0 1 2.1-.4c.8.3 1.7.5 2.6.6a2 2 0 0 1 1.7 2z" />),
+  trash: ico(<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />),
+  swap: ico(<><path d="M17 1l4 4-4 4" /><path d="M3 11V9a4 4 0 0 1 4-4h14" /><path d="M7 23l-4-4 4-4" /><path d="M21 13v2a4 4 0 0 1-4 4H3" /></>),
+  doc: ico(<><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6M9 13h6M9 17h4" /></>),
+  sync: ico(<><path d="M21 2v6h-6" /><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M3 22v-6h6" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /></>),
+};
+
+// Sparklines de tendencia (ilustrativos, deterministas: sin datos históricos
+// reales todavía). Se reemplazarán por series de eventos por día cuando existan.
+const SPARK = {
+  activos: [42, 45, 44, 48, 52, 51, 55, 58, 60, 63, 67, 71],
+  bajas: [12, 14, 13, 15, 14, 16, 15, 14, 13, 14, 13, 12],
+  cambios: [22, 26, 24, 30, 28, 33, 31, 36, 34, 38, 41, 44],
+  eventos: [55, 60, 58, 64, 68, 66, 72, 78, 80, 85, 88, 92],
+  corridas: [4, 5, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12],
+};
+
 export default async function Page() {
   const [kpis, byState, byOperator, byModalidad, mostChanged, matrix] = await Promise.all([
     getKpis(),
@@ -61,41 +85,79 @@ export default async function Page() {
   }));
 
   return (
-    <main className="container">
-      <header style={{ marginBottom: 24 }}>
-        <h1 style={{ fontSize: 26 }}>Portabilidad numérica — México</h1>
-        <p className="secondary" style={{ marginTop: 6, fontSize: 15 }}>
-          Comportamiento de la portabilidad: cantidad de números, distribución por
-          estado y operador, e historial de cambios.
-        </p>
-      </header>
+    <>
+      <div className="page-head" style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
+        <div>
+          <h1 style={{ fontSize: 22 }}>Panel general</h1>
+          <p className="secondary" style={{ marginTop: 4, fontSize: 13.5 }}>
+            Comportamiento de la portabilidad: cantidad de números, distribución por
+            estado y operador, e historial de cambios.
+          </p>
+        </div>
+      </div>
 
       {/* KPIs */}
       <section
         className="grid"
-        style={{ gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}
+        style={{ gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}
       >
-        <StatTile label="Números activos" value={kpis.activos} hint="portados vigentes" />
+        <StatTile
+          label="Números activos"
+          value={kpis.activos}
+          hint="portados vigentes"
+          icon={ICONS.phone}
+          accent="var(--c1)"
+          delta="+3.2%"
+          deltaDir="up"
+          spark={SPARK.activos}
+          sparkColor="var(--c1)"
+        />
         <StatTile
           label="Dados de baja"
           value={kpis.dadosDeBaja}
           hint="históricos"
+          icon={ICONS.trash}
           accent="var(--critical)"
+          delta="-1.1%"
+          deltaDir="down"
+          spark={SPARK.bajas}
+          sparkColor="var(--critical)"
         />
         <StatTile
           label="Cambios de operador"
           value={kpis.cambiosOperador}
           hint="re-portaciones"
+          icon={ICONS.swap}
           accent="var(--warning)"
+          delta="+5.7%"
+          deltaDir="warn"
+          spark={SPARK.cambios}
+          sparkColor="var(--warning)"
         />
-        <StatTile label="Eventos registrados" value={kpis.totalEventos} hint="altas + bajas + cambios" />
-        <StatTile label="Sincronizaciones" value={kpis.corridas} hint="corridas OK" />
+        <StatTile
+          label="Eventos registrados"
+          value={kpis.totalEventos}
+          hint="altas + bajas + cambios"
+          icon={ICONS.doc}
+          accent="var(--c3)"
+          spark={SPARK.eventos}
+          sparkColor="var(--c3)"
+        />
+        <StatTile
+          label="Sincronizaciones"
+          value={kpis.corridas}
+          hint="corridas OK"
+          icon={ICONS.sync}
+          accent="var(--c7)"
+          spark={SPARK.corridas}
+          sparkColor="var(--c7)"
+        />
       </section>
 
       {/* Mapa + tabla por estado */}
       <section
         className="grid"
-        style={{ gridTemplateColumns: "1.4fr 1fr", marginTop: 16, alignItems: "start" }}
+        style={{ gridTemplateColumns: "1.4fr 1fr", alignItems: "start" }}
       >
         <Choropleth
           geo={geo as any}
@@ -109,7 +171,7 @@ export default async function Page() {
       {/* Operador + modalidad */}
       <section
         className="grid"
-        style={{ gridTemplateColumns: "1fr 1fr", marginTop: 16, alignItems: "start" }}
+        style={{ gridTemplateColumns: "1fr 1fr", alignItems: "start" }}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <BarList items={operatorItems} title="Distribución por operador" unit="números" />
@@ -138,7 +200,7 @@ export default async function Page() {
       </section>
 
       {/* Cruce operador x estado */}
-      <section style={{ marginTop: 16 }}>
+      <section>
         <Heatmap
           operators={matrix.operators}
           states={matrix.states}
@@ -147,12 +209,12 @@ export default async function Page() {
       </section>
 
       {/* Buscador de historial */}
-      <section style={{ marginTop: 16 }}>
+      <section id="buscador" style={{ scrollMarginTop: 70 }}>
         <NumberSearch />
       </section>
 
       {/* Ranking de más cambiados */}
-      <section className="card" style={{ marginTop: 16 }}>
+      <section className="card">
         <h3 style={{ fontSize: 15 }}>Números con más cambios</h3>
         <div style={{ overflowX: "auto", marginTop: 12 }}>
           <table>
@@ -189,9 +251,9 @@ export default async function Page() {
         </div>
       </section>
 
-      <footer className="muted" style={{ marginTop: 32, fontSize: 12 }}>
-        Estado geográfico derivado del NIR según el catálogo del IFT.
+      <footer className="muted" style={{ marginTop: 16, fontSize: 12 }}>
+        Estado geográfico derivado del NIR según el catálogo del IFT. · Datos de demostración.
       </footer>
-    </main>
+    </>
   );
 }
