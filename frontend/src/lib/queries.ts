@@ -163,6 +163,193 @@ export async function getOperatorStateMatrix(topOperators = 8, topStates = 12) {
   return { operators, states, matrix };
 }
 
+/**
+ * Estados con su desglose: activos, dados de baja y operador dominante.
+ * Alimenta el indice /estados. Se hacen dos groupBy (por estado y por
+ * estado+operador) en vez de N consultas por estado.
+ */
+export async function getStateIndex() {
+  const [porEstado, porEstadoOp] = await Promise.all([
+    prisma.number.groupBy({
+      by: ["state", "status"],
+      _count: { _all: true },
+    }),
+    prisma.number.groupBy({
+      by: ["state", "operator"],
+      where: { status: "active" },
+      _count: { _all: true },
+    }),
+  ]);
+
+  const acc = new Map<
+    string,
+    { state: string; activos: number; bajas: number; operadores: Map<string, number> }
+  >();
+  const get = (s: string | null) => {
+    const key = s ?? "Sin identificar";
+    let e = acc.get(key);
+    if (!e) {
+      e = { state: key, activos: 0, bajas: 0, operadores: new Map() };
+      acc.set(key, e);
+    }
+    return e;
+  };
+
+  for (const r of porEstado) {
+    const e = get(r.state);
+    if (r.status === "active") e.activos += r._count._all;
+    else e.bajas += r._count._all;
+  }
+  for (const r of porEstadoOp) {
+    const e = get(r.state);
+    e.operadores.set(r.operator, (e.operadores.get(r.operator) ?? 0) + r._count._all);
+  }
+
+  return [...acc.values()]
+    .map((e) => {
+      const top = [...e.operadores.entries()].sort((a, b) => b[1] - a[1])[0];
+      return {
+        state: e.state,
+        activos: e.activos,
+        bajas: e.bajas,
+        operadores: e.operadores.size,
+        topOperador: top ? top[0] : "—",
+        topOperadorCount: top ? top[1] : 0,
+      };
+    })
+    .sort((a, b) => b.activos - a.activos);
+}
+
+/** Detalle de un estado: KPIs, operadores y modalidades. */
+export async function getStateDetail(state: string) {
+  const [activos, bajas, porOperador, porModalidad, nirs] = await Promise.all([
+    prisma.number.count({ where: { state, status: "active" } }),
+    prisma.number.count({ where: { state, status: "deleted" } }),
+    prisma.number.groupBy({
+      by: ["operator"],
+      where: { state, status: "active" },
+      _count: { _all: true },
+    }),
+    prisma.number.groupBy({
+      by: ["modalidad"],
+      where: { state, status: "active" },
+      _count: { _all: true },
+    }),
+    prisma.nirCatalog.findMany({ where: { state }, orderBy: { nir: "asc" } }),
+  ]);
+  return {
+    activos,
+    bajas,
+    operadores: porOperador
+      .map((r) => ({ operator: r.operator, count: r._count._all }))
+      .sort((a, b) => b.count - a.count),
+    modalidades: porModalidad
+      .map((r) => ({ modalidad: r.modalidad ?? "Sin dato", count: r._count._all }))
+      .sort((a, b) => b.count - a.count),
+    nirs,
+  };
+}
+
+/**
+ * Indice de operadores con ganados/perdidos/bajas, para /operadores.
+ * Se resuelve con 4 groupBy en lugar de 4 consultas por operador.
+ */
+export async function getOperatorIndex() {
+  const [activos, bajas, ganados, perdidos] = await Promise.all([
+    prisma.number.groupBy({
+      by: ["operator"],
+      where: { status: "active" },
+      _count: { _all: true },
+    }),
+    prisma.number.groupBy({
+      by: ["operator"],
+      where: { status: "deleted" },
+      _count: { _all: true },
+    }),
+    prisma.numberEvent.groupBy({
+      by: ["operatorTo"],
+      _count: { _all: true },
+    }),
+    prisma.numberEvent.groupBy({
+      by: ["operatorFrom"],
+      where: { eventType: "OPERATOR_CHANGE" },
+      _count: { _all: true },
+    }),
+  ]);
+
+  const acc = new Map<
+    string,
+    { operator: string; activos: number; bajas: number; ganados: number; perdidos: number }
+  >();
+  const get = (o: string) => {
+    let e = acc.get(o);
+    if (!e) {
+      e = { operator: o, activos: 0, bajas: 0, ganados: 0, perdidos: 0 };
+      acc.set(o, e);
+    }
+    return e;
+  };
+  for (const r of activos) get(r.operator).activos = r._count._all;
+  for (const r of bajas) get(r.operator).bajas = r._count._all;
+  for (const r of ganados) if (r.operatorTo) get(r.operatorTo).ganados = r._count._all;
+  for (const r of perdidos) if (r.operatorFrom) get(r.operatorFrom).perdidos = r._count._all;
+
+  return [...acc.values()].sort((a, b) => b.activos - a.activos);
+}
+
+/** Corridas de sincronizacion, mas recientes primero. */
+export async function getSyncRuns(limit = 100) {
+  return prisma.syncRun.findMany({
+    orderBy: { startedAt: "desc" },
+    take: limit,
+  });
+}
+
+/** Resumen de las corridas para los KPIs de /sincronizaciones. */
+export async function getSyncSummary() {
+  const [total, ok, error, corriendo, ultima] = await Promise.all([
+    prisma.syncRun.count(),
+    prisma.syncRun.count({ where: { status: "ok" } }),
+    prisma.syncRun.count({ where: { status: "error" } }),
+    prisma.syncRun.count({ where: { status: "running" } }),
+    prisma.syncRun.findFirst({ orderBy: { startedAt: "desc" } }),
+  ]);
+  return { total, ok, error, corriendo, ultima };
+}
+
+/**
+ * Historial de eventos paginado, con filtro opcional por tipo.
+ * Devuelve las filas y el total para poder paginar.
+ */
+export async function getEvents({
+  page = 1,
+  perPage = 50,
+  eventType,
+}: { page?: number; perPage?: number; eventType?: string } = {}) {
+  const where = eventType ? { eventType } : {};
+  const [rows, total] = await Promise.all([
+    prisma.numberEvent.findMany({
+      where,
+      orderBy: { occurredAt: "desc" },
+      skip: (page - 1) * perPage,
+      take: perPage,
+    }),
+    prisma.numberEvent.count({ where }),
+  ]);
+  return { rows, total, page, perPage };
+}
+
+/** Conteo de eventos por tipo, para los filtros/KPIs de /eventos. */
+export async function getEventTypeCounts() {
+  const rows = await prisma.numberEvent.groupBy({
+    by: ["eventType"],
+    _count: { _all: true },
+  });
+  return rows
+    .map((r) => ({ eventType: r.eventType, count: r._count._all }))
+    .sort((a, b) => b.count - a.count);
+}
+
 /** Numeros con mas cambios (ranking de "mas portados"). */
 export async function getMostChanged(limit = 15) {
   return prisma.number.findMany({

@@ -44,7 +44,10 @@ export function Heatmap({
         </p>
       ) : (
         <div style={{ overflowX: "auto", marginTop: 14 }}>
-          <table style={{ borderCollapse: "separate", borderSpacing: 2 }}>
+          {/* width:auto anula el 'table { width: 100% }' global: si no, la tabla
+              se estira al ancho de la tarjeta y, como las celdas son de 26px
+              fijos, la rejilla queda pegada a la derecha con un hueco enorme. */}
+          <table style={{ borderCollapse: "separate", borderSpacing: 2, width: "auto" }}>
             <thead>
               <tr>
                 <th style={{ border: "none", background: "transparent" }} />

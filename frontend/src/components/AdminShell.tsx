@@ -59,12 +59,12 @@ const ICON = {
 const NAV_GENERAL: NavEntry[] = [
   { href: "/", label: "Panel general", icon: ICON.panel },
   { href: "/#buscador", label: "Buscar número", icon: ICON.search },
-  { href: "/estados", label: "Por estado", icon: ICON.map, soon: true },
-  { href: "/operadores", label: "Por operador", icon: ICON.bars, soon: true },
+  { href: "/estados", label: "Por estado", icon: ICON.map },
+  { href: "/operadores", label: "Por operador", icon: ICON.bars },
 ];
 const NAV_DATOS: NavEntry[] = [
-  { href: "/sincronizaciones", label: "Sincronizaciones", icon: ICON.sync, soon: true },
-  { href: "/eventos", label: "Historial de eventos", icon: ICON.clock, soon: true },
+  { href: "/sincronizaciones", label: "Sincronizaciones", icon: ICON.sync },
+  { href: "/eventos", label: "Historial de eventos", icon: ICON.clock },
 ];
 
 function isActive(pathname: string, href: string): boolean {
@@ -73,11 +73,16 @@ function isActive(pathname: string, href: string): boolean {
 }
 
 // Titulo del breadcrumb segun la ruta (fallback: "Panel general").
+// En las rutas de detalle se muestra la ENTIDAD (p. ej. "Jalisco"), no el
+// nombre de la seccion: el usuario ya sabe en que seccion esta por el sidebar.
 function crumbFor(pathname: string): string {
+  if (pathname.startsWith("/operador/") || pathname.startsWith("/estados/")) {
+    const slug = pathname.split("/")[2];
+    if (slug) return decodeURIComponent(slug);
+  }
   const all = [...NAV_GENERAL, ...NAV_DATOS];
   const hit = all.find((n) => isActive(pathname, n.href));
   if (hit) return hit.label;
-  if (pathname.startsWith("/operador/")) return "Operador";
   return "Panel general";
 }
 
@@ -141,24 +146,28 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className={"shell" + (collapsed ? " collapsed" : "")}>
+      {/* El <aside> pinta el fondo en toda la altura de la pagina; el div
+          interior es el que hace sticky al hacer scroll. */}
       <aside className="sidebar">
-        <div className="brand">
-          <div className="logo">P</div>
-          <div className="name">
-            Portabilidad
-            <small>México · IFT</small>
+        <div className="sidebar-inner">
+          <div className="brand">
+            <div className="logo">P</div>
+            <div className="name">
+              Portabilidad
+              <small>México · IFT</small>
+            </div>
           </div>
-        </div>
 
-        <div className="nav-group-label">General</div>
-        {renderNav(NAV_GENERAL)}
+          <div className="nav-group-label">General</div>
+          {renderNav(NAV_GENERAL)}
 
-        <div className="nav-group-label">Datos</div>
-        {renderNav(NAV_DATOS)}
+          <div className="nav-group-label">Datos</div>
+          {renderNav(NAV_DATOS)}
 
-        <div className="side-foot">
-          <span className="dot" />
-          <span>Datos de demostración</span>
+          <div className="side-foot">
+            <span className="dot" />
+            <span>Datos de demostración</span>
+          </div>
         </div>
       </aside>
 

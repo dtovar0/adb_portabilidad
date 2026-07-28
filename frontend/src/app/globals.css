@@ -158,9 +158,15 @@ th.num {
   --sbw: 64px;
 }
 
+/* El <aside> NO es el elemento sticky: ocupa toda la altura de la pagina para
+   que el fondo oscuro llegue hasta abajo (antes, con 'height:100vh' + sticky,
+   se cortaba al alto del viewport y dejaba una banda clara en las paginas
+   largas). Quien hace sticky es .sidebar-inner. */
 .sidebar {
   background: var(--sidebar);
   color: var(--sidebar-text);
+}
+.sidebar-inner {
   display: flex;
   flex-direction: column;
   position: sticky;
@@ -341,6 +347,31 @@ th.num {
   max-width: 1400px;
   width: 100%;
   margin: 0 auto;
+}
+
+/* Encabezado de pagina (titulo + bajada), comun a todas las secciones. */
+.page-head {
+  margin-bottom: 2px;
+}
+
+/* Controles de paginacion: enlaces normales, con estado deshabilitado. */
+.pager {
+  font-size: 12.5px;
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  text-decoration: none;
+  color: var(--text-secondary);
+  background: var(--surface-1);
+  white-space: nowrap;
+}
+.pager:hover {
+  border-color: var(--seq-400);
+  color: var(--text-primary);
+}
+.pager.disabled {
+  opacity: 0.4;
+  pointer-events: none;
 }
 
 @media (max-width: 900px) {
