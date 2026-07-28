@@ -164,6 +164,10 @@ LOG_DIR = os.environ.get("LOG_DIR", "")
 # inexistente. Con false se exige que ya existan (falla si falta alguno).
 CREATE_DIRS = env_bool("CREATE_DIRS", True)
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "20000"))
+# Marcador que el equipo exige en la PRIMERA linea de todo batch_script. Se
+# centraliza aqui para que las tres funciones que lo escriben o lo detectan
+# (extract_lines, recortar_parte, validar_batch) no puedan divergir.
+HEADER_CLI = "?EMS::CLI?"
 # Tolerancia (en lineas) permitida entre los 'Result: Ok' del log y las lineas
 # esperadas del archivo en validar_batch(). El EMS puede no volcar al log el
 # 'Result: Ok' final del propio 'execute batch_script' antes de que el 'exit'
@@ -445,12 +449,23 @@ def extract_lines(input_file, output_file, start_line, end_line):
   with open(input_file, 'r') as infile:
     lines = infile.readlines()
 
+  # Si el CSV de origen YA trae el header, se descarta de la lista de comandos: el
+  # header lo agrega esta funcion, y dejar el del origen lo duplicaria en la parte
+  # 1 (linea 1 el nuestro, linea 2 el suyo). El EMS acepta el de la linea 1 como
+  # marcador e intenta EJECUTAR el de la linea 2 como comando, fallando con
+  # "Error: (SYN_ERR) Unrecognized argument(s): ?EMS::CLI? @[line: 2, command#: 1]".
+  # Solo afectaba a la parte 1; las demas empiezan mas adelante en el archivo.
+  # Los indices start_line/end_line son SIEMPRE sobre comandos (sin header), asi
+  # el troceo no se desfasa segun el origen traiga header o no.
+  if lines and lines[0].strip() == HEADER_CLI:
+    lines = lines[1:]
+
   with open(output_file, 'w') as outfile:
     # El header '?EMS::CLI?' va en la PRIMERA linea de TODAS las partes: el equipo
     # valida que el batch_script empiece con este marcador y, si falta, rechaza el
     # archivo con "The input script file is NOT a valid EMS::CLI script! @[line: 1,
     # command#: 0]". (Se habia quitado por error en 8298e38; el equipo lo exige.)
-    outfile.write("?EMS::CLI?\n")
+    outfile.write("%s\n" % HEADER_CLI)
 
     for i in range(start_line, end_line):
       if 0 <= i < len(lines):
@@ -485,7 +500,7 @@ def recortar_parte(nombre_parte, comandos_ok):
 
   # Se separa el header de los comandos: 'comandos_ok' cuenta COMANDOS, no lineas
   # del archivo, y el header no genera comando.
-  if lineas and lineas[0].strip() == "?EMS::CLI?":
+  if lineas and lineas[0].strip() == HEADER_CLI:
     comandos = lineas[1:]
   else:
     comandos = lineas
@@ -512,7 +527,7 @@ def recortar_parte(nombre_parte, comandos_ok):
   with open(ruta, "w") as f:
     # El header es obligatorio en TODA parte que se envie: el equipo rechaza el
     # batch_script si la primera linea no es '?EMS::CLI?'.
-    f.write("?EMS::CLI?\n")
+    f.write("%s\n" % HEADER_CLI)
     f.writelines(comandos[inicio:])
 
   print("[REANUDAR-PARTE] %s: el EMS confirmo %d de %d comando(s); se reenvian "

@@ -687,6 +687,29 @@ def comparar(prefijos):
   return lineas_put, lineas_del
 
 
+def contar_comandos_csv(ruta):
+  """Cuenta los comandos de un CSV de diferencias ya generado (PORTED/DELETED).
+
+  Sirve para reportar las diferencias cuando la corrida NO comparo (SKIP_COMPARE
+  reusa los CSV de una corrida previa): el dato esta en el archivo, no hace falta
+  volver a comparar ABD contra PSX.
+
+  El CSV consolidado que escribe escribir_salida() son SOLO comandos put/delete,
+  sin el header '?EMS::CLI?' (ese lo agrega despues extract_lines() al trocear
+  cada parte). Por eso aqui no se resta ningun header: se cuentan las lineas no
+  vacias y ese es el numero de comandos.
+
+  Devuelve None si el archivo no se puede leer, para que el resumen distinga
+  "no se pudo contar" de un cero real."""
+  try:
+    with open(ruta, "r", errors="ignore") as f:
+      return sum(1 for ln in f if ln.strip())
+  except OSError as e:
+    print("[FULL_SYNC] No se pudo contar los comandos de %s: %s" % (ruta, e),
+          file=sys.stderr)
+    return None
+
+
 def escribir_salida(tipo, label, lineas):
   """Escribe el CSV consolidado que ejecutara mtysajpsx01.py.
   El nombre se construye con mtysajpsx01.nombre_base para que coincida
@@ -810,6 +833,9 @@ def main():
       print("[ERROR] SKIP_COMPARE=true con --no-execute no hace nada: se salta "
             "la generacion y tampoco se ejecuta. Usa uno u otro.", file=sys.stderr)
       return 2
+    # Conteo de los CSV reusados: aunque esta corrida no compare, las diferencias
+    # SI se pueden reportar leyendo los archivos que se van a ejecutar.
+    conteos = {}
     for tipo in ("PORTED", "DELETED"):
       csv = os.path.join(DIRFILES, "%s.csv" % mtysajpsx01.nombre_base(tipo, label))
       if not os.path.isfile(csv):
@@ -817,8 +843,15 @@ def main():
               "        Genera las diferencias con una corrida previa (sin "
               "SKIP_COMPARE), o desactiva SKIP_COMPARE." % csv, file=sys.stderr)
         return 2
+      conteos[tipo] = contar_comandos_csv(csv)
+    n_ported = conteos["PORTED"]
+    n_deleted = conteos["DELETED"]
     print("[FULL_SYNC] SKIP_COMPARE=true: se omite descarga/troceo/comparacion; "
           "se reusan los CSV PORTED/DELETED existentes y se ejecuta directo.")
+    print("[FULL_SYNC] Diferencias en los CSV reusados: %s alta(s) (PORTED), "
+          "%s baja(s) (DELETED)."
+          % ("?" if n_ported is None else "{:,}".format(n_ported),
+             "?" if n_deleted is None else "{:,}".format(n_deleted)))
   else:
     # 1) Descarga de cada base (o reuso del CSV previo si SKIP_ABD/SKIP_PSX).
     #    Al saltar una descarga se REUSA el intermedio de una corrida anterior
@@ -877,7 +910,9 @@ def main():
   etiqueta = (" [%s]" % label) if label else ""
 
   def _fmt_diff(n):
-    return "no calculado (reuso de CSV previo)" if n is None else "{:,}".format(n)
+    # None solo si el CSV no se pudo leer: con SKIP_COMPARE el conteo se saca del
+    # propio archivo reusado, asi que el caso normal siempre trae numero.
+    return "no disponible (no se pudo leer el CSV)" if n is None else "{:,}".format(n)
 
   def _imprimir_resumen(estado_txt, lineas_exec, salida):
     """Arma el resumen final (duracion total y por fase, PORTED/DELETED
