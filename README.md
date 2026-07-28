@@ -11,6 +11,9 @@ portabilidad/
 ├── utils/       Scripts Python de sincronización con el equipo SONUS/EMS
 │   ├── full_sync.py      Descarga ABD/PSX, compara y genera/ejecuta CSV de comandos
 │   ├── mtysajpsx01.py    Ejecuta los CSV contra el equipo (scp + CLI remoto)
+│   ├── run_diario.sh     Wrapper de cron para el diario (mtysajpsx01)
+│   ├── run_full_sync.sh  Wrapper de cron para el full sync
+│   ├── entorno.sh        venv + PATH compartido por los wrappers
 │   └── docs/             Reglas de negocio
 ├── backend/     BD de tracking (Prisma) + ingesta
 │   ├── prisma/schema.prisma   Modelo con historial de cambios e índices
@@ -74,6 +77,86 @@ Ambos registran eventos y actualizan `changeCount`. El estado (entidad
 federativa) se deriva del NIR del número (primeros 2 dígitos para 55/33/81, 3
 para el resto) contra el catálogo del IFT.
 
+## Sincronización con el equipo (utils/)
+
+Dos procesos distintos, ambos generan comandos CLI y los ejecutan contra el
+equipo (scp + `execute batch_script`, en partes de `CHUNK_SIZE` con reintentos,
+recuperación y checkpoint):
+
+```bash
+# Diario: portabilidad de una fecha (PORTED y DELETED)
+python mtysajpsx01.py --date 20260727
+python mtysajpsx01.py --date-from 20260701 --date-to 20260727   # un rango
+python mtysajpsx01.py --date 20260727 --type PORTED             # solo altas
+
+# Full sync: snapshot completo, compara ABD vs PSX (sin fechas)
+python full_sync.py
+python full_sync.py --no-execute    # solo genera los CSV, no toca el equipo
+python full_sync.py --check         # solo compara conteos (sale 1 si no cuadran)
+```
+
+El diario **va un día atrás**: el CSV de un día se genera al día siguiente, así
+que rechaza cualquier fecha `>= hoy`. Los domingos y festivos se omiten según
+`SKIP_SUNDAY` / `SKIP_HOLIDAYS` (evaluados contra la fecha del *dato*, no la de
+ejecución).
+
+### Alta en cron
+
+Cron **no** es un shell de login: arranca con `PATH` mínimo, sin las variables
+del perfil, con el cwd en `$HOME` y **sin el venv activado**. Por eso no se
+invoca el `.py` directo, sino los wrappers de `utils/`, que fijan ese entorno:
+
+| Wrapper | Ejecuta | Notas |
+| --- | --- | --- |
+| `run_diario.sh` | `mtysajpsx01.py` | Si no le pasas fecha, usa **ayer** |
+| `run_full_sync.sh` | `full_sync.py` | Sin fechas (snapshot completo) |
+| `entorno.sh` | — | venv + `PATH` compartido; se incluye, no se ejecuta |
+
+Da de alta las tareas con `crontab -e` **como el usuario que debe correrlas**
+(si el `.env` define `RUN_AS_USER`, el script aborta si no coincide):
+
+```cron
+VENV_DIR=/ruta/a/tu/venv
+
+# Diario, 2:30 AM: procesa AYER (PORTED y DELETED)
+30 2 * * * /home/dtovar/bayblade/portabilidad/utils/run_diario.sh >> /home/dtovar/bayblade/portabilidad/logs/diario_$(date +\%Y\%m\%d).log 2>&1
+
+# Full sync, domingos 4:00 AM
+0 4 * * 0 /home/dtovar/bayblade/portabilidad/utils/run_full_sync.sh >> /home/dtovar/bayblade/portabilidad/logs/full_sync_$(date +\%Y\%m\%d).log 2>&1
+```
+
+Antes del primer disparo:
+
+```bash
+mkdir -p logs                       # cron no crea el directorio del log
+utils/run_full_sync.sh --check      # valida credenciales y conexión a ambas BD
+```
+
+Detalles que suelen morder:
+
+- **Escapa los `%`** (`\%`) en el crontab: sin escapar, cron los interpreta como
+  salto de línea y la tarea falla.
+- **El venv** se busca en `VENV_DIR`, `<repo>/venv`, `<repo>/.venv` y
+  `$HOME/venv`. Si está en el repo puedes omitir la línea `VENV_DIR`. Si no
+  encuentra ninguno, avisa por stderr y cae al `python3` del sistema.
+- **Llaves SSH sin passphrase**: bajo cron no hay agente SSH, así que un `scp`
+  con llave protegida se queda colgado. Para simular ese entorno (más hostil que
+  cron, porque `env -i` borra incluso el `PATH`), usa rutas absolutas:
+  `env -i HOME=$HOME /bin/bash -c "$PWD/utils/run_diario.sh --date 20260727"`.
+- **Sin corridas solapadas**: cada wrapper toma su propio cerrojo (`flock -n`) y
+  sale sin hacer nada si ya hay una corriendo, para que dos procesos no peleen
+  por los mismos CSV, el checkpoint y la sesión CLI. El diario y el full sync
+  usan cerrojos distintos, así que no se bloquean entre sí.
+- **El crontab correcto**: `DIRFILES` / `LOG_DIR` del `.env` suelen apuntar al
+  home de un usuario de servicio (p. ej. `airflow`). El crontab tiene que ser el
+  de **ese** usuario (`sudo -u airflow crontab -e`), o el proceso fallará al
+  crear los directorios de trabajo. Ojo con los typos en esas rutas: con
+  `CREATE_DIRS=true` el script crea el directorio mal escrito sin avisar, y el
+  checkpoint se va con él si `CHECKPOINT_DIR` está vacío (hereda `LOG_DIR`).
+- **Reanudación**: si una parte falla, se reintenta recortando el batch desde
+  donde el EMS se quedó (`RESUME_PARTIAL`, `RESUME_TOLERANCE`). Si el proceso
+  muere, el checkpoint permite retomar sin repetir las partes ya completadas.
+
 ## Dashboard
 
 ```bash
@@ -89,8 +172,16 @@ Vistas:
 - **Home** — KPIs, mapa coroplético por estado, top estados, distribución por
   operador y modalidad, cruce operador × estado (heatmap), buscador de historial,
   ranking de números con más cambios.
-- **/operador/[operador]** — vista dedicada: KPIs (activos, ganados, perdidos),
-  mapa y top estados de ese operador.
+- **/estados** — mapa y tabla por entidad (activos, participación, bajas,
+  operador dominante); cada fila entra a **/estados/[estado]**, con sus
+  operadores, modalidades y los NIR del catálogo IFT.
+- **/operadores** — índice con balance de portabilidad (ganados, perdidos, neto);
+  enlaza a **/operador/[operador]**, la vista dedicada con KPIs, mapa y top
+  estados de ese operador.
+- **/sincronizaciones** — última corrida e historial de `sync_runs` (estado,
+  duración, registros vistos/nuevos/actualizados).
+- **/eventos** — historial paginado de altas, bajas y cambios de operador, con
+  filtro por tipo.
 
 ## Notas
 
