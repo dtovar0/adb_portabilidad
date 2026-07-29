@@ -754,6 +754,24 @@ def main():
                            "Sin etiqueta se sobrescriben <PREFIX>_<TYPE>.csv.")
   parser.add_argument("--no-execute", dest="no_execute", action="store_true",
                       help="Solo generar los CSV de diferencias; no ejecutarlos contra el equipo.")
+  parser.add_argument("--download-only", "--only-download", dest="download_only",
+                      action="store_true",
+                      help="Solo DESCARGAR las dos BD a abd.csv/psx.csv en el workdir "
+                           "y terminar: no trocea, no compara, no escribe diferencias "
+                           "y no ejecuta nada contra el equipo. Implica conservar los "
+                           "intermedios (como SYNC_KEEP_INTERMEDIATE=true), que son "
+                           "justo lo que se queria bajar. Baja AMBAS bases; usa "
+                           "--only abd|psx para bajar solo una.")
+  parser.add_argument("--only", dest="only", choices=("abd", "psx"),
+                      help="Descarga SOLO la base indicada (abd o psx) en vez de las "
+                           "dos. Solo tiene sentido con --download-only: a diferencia "
+                           "de SKIP_ABD/SKIP_PSX (que REUSAN el CSV previo y abortan "
+                           "si no existe), esto simplemente no toca la otra base.")
+  parser.add_argument("--keep-intermediate", dest="keep_intermediate",
+                      action="store_true",
+                      help="Conserva los intermedios abd*.csv/psx*.csv al terminar "
+                           "(equivale a SYNC_KEEP_INTERMEDIATE=true sin tocar el .env). "
+                           "Necesario para reusarlos luego con SKIP_ABD/SKIP_PSX.")
   parser.add_argument("--check", action="store_true",
                       help="Solo valida la cantidad de registros de cada BD "
                            "(SELECT COUNT(*)) sin descargar ni comparar. ABD es el "
@@ -762,6 +780,46 @@ def main():
   args = parser.parse_args()
 
   label = (args.label or "").strip()
+
+  # --download-only y --keep-intermediate conservan los intermedios pase lo que
+  # diga el .env: en el primer caso los CSV descargados son el entregable, y en el
+  # segundo es una peticion explicita. limpiar_intermedios() lee este global, asi
+  # que se sobreescribe aqui (nunca al reves: el flag solo puede activarlo).
+  if args.download_only or args.keep_intermediate:
+    global SYNC_KEEP_INTERMEDIATE
+    SYNC_KEEP_INTERMEDIATE = True
+
+  # --only solo aplica a la descarga: bajar una sola base y seguir a comparar
+  # generaria diffs contra una base ausente/vieja, o sea altas y bajas indebidas.
+  # Se exige --download-only en vez de asumirlo (fallar es mas seguro que adivinar).
+  if args.only and not args.download_only:
+    print("[ERROR] --only %s requiere --download-only: comparar con una sola base "
+          "recien bajada generaria diferencias incorrectas.\n"
+          "        Para reusar el CSV de la otra base y comparar, usa SKIP_%s=true."
+          % (args.only, ("psx" if args.only == "abd" else "abd").upper()),
+          file=sys.stderr)
+    return 2
+
+  # --download-only es incompatible con SKIP_COMPARE (que justamente salta la
+  # descarga para ejecutar CSV previos): no quedaria nada por bajar.
+  if args.download_only and SKIP_COMPARE:
+    print("[ERROR] --download-only con SKIP_COMPARE=true no hace nada: "
+          "SKIP_COMPARE salta la descarga. Usa uno u otro.", file=sys.stderr)
+    return 2
+  # Que la unica base a bajar este saltada no deja nada que descargar. Con --only
+  # basta con que su propia base este saltada; sin --only, ambas.
+  if args.download_only:
+    saltadas = {"abd": SKIP_ABD, "psx": SKIP_PSX}
+    if args.only and saltadas[args.only]:
+      print("[ERROR] --download-only --only %s con SKIP_%s=true no descarga nada: "
+            "esa base esta marcada para reusarse. Desactiva SKIP_%s "
+            "(o SKIP_DB_DOWNLOAD)." % (args.only, args.only.upper(), args.only.upper()),
+            file=sys.stderr)
+      return 2
+    if not args.only and SKIP_ABD and SKIP_PSX:
+      print("[ERROR] --download-only con SKIP_ABD y SKIP_PSX activos no descarga "
+            "nada. Desactiva al menos uno (o SKIP_DB_DOWNLOAD).", file=sys.stderr)
+      return 2
 
   # Instante de arranque y acumulador de duraciones por fase para el resumen
   # final. Cada fase escribe su tiempo aqui; las que no corren (por skip/flags)
@@ -801,7 +859,8 @@ def main():
   validar_configuracion()
   # Si tambien se va a ejecutar contra el equipo, valida esa config AHORA para
   # fallar temprano (antes de descargar las BD), no despues de generar los CSV.
-  if not args.no_execute:
+  # (--download-only tampoco ejecuta, asi que no exige la config del equipo.)
+  if not args.no_execute and not args.download_only:
     mtysajpsx01.validar_configuracion()
 
   os.makedirs(SYNC_WORKDIR, exist_ok=True)
@@ -869,43 +928,59 @@ def main():
       print("[FULL_SYNC] SKIP_%s=true: se reusa %s (%s)."
             % (base.upper(), ruta, peso_archivo(ruta)))
 
-    if SKIP_ABD:
+    # Con --only la otra base se omite por completo: ni se baja ni se exige su CSV
+    # (a diferencia de SKIP_*, que si lo exige para reusarlo). Solo puede ocurrir
+    # junto a --download-only, que corta antes de comparar; el guarda de arriba lo
+    # garantiza, asi que nunca se compara contra una base no descargada.
+    def _toca(base):
+      return args.only is None or args.only == base
+
+    if not _toca("abd"):
+      print("[FULL_SYNC] --only psx: se omite ABD (no se descarga).")
+    elif SKIP_ABD:
       _reusar_o_error("abd")
     else:
       t_abd = time.monotonic()
       descargar_abd()
       fases["Descarga ABD"] = time.monotonic() - t_abd
 
-    if SKIP_PSX:
+    if not _toca("psx"):
+      print("[FULL_SYNC] --only abd: se omite PSX (no se descarga).")
+    elif SKIP_PSX:
       _reusar_o_error("psx")
     else:
       t_psx = time.monotonic()
       descargar_psx()
       fases["Descarga PSX"] = time.monotonic() - t_psx
 
-    # 2) Troceo por prefijo (si el loteo esta activo) y comparacion. comparar()
-    #    carga solo un lote por lado a la vez (control de memoria).
-    print("[FULL_SYNC] === Iniciando TROCEO por prefijo (%d lote(s)) ===" % len(prefijos))
-    t_split = time.monotonic()
-    split_por_prefijo("abd", prefijos)
-    split_por_prefijo("psx", prefijos)
-    fases["Troceo"] = time.monotonic() - t_split
-    print("[FULL_SYNC] Troceo completado en %.1fs." % fases["Troceo"])
+    # --download-only se detiene tras la descarga: no trocea (no genera los 2*N
+    # lotes), no compara y no escribe diferencias. Los abd.csv/psx.csv quedan en
+    # disco porque el flag ya forzo SYNC_KEEP_INTERMEDIATE. El resumen y el return
+    # estan mas abajo, donde _imprimir_resumen ya esta definida.
+    if not args.download_only:
+      # 2) Troceo por prefijo (si el loteo esta activo) y comparacion. comparar()
+      #    carga solo un lote por lado a la vez (control de memoria).
+      print("[FULL_SYNC] === Iniciando TROCEO por prefijo (%d lote(s)) ===" % len(prefijos))
+      t_split = time.monotonic()
+      split_por_prefijo("abd", prefijos)
+      split_por_prefijo("psx", prefijos)
+      fases["Troceo"] = time.monotonic() - t_split
+      print("[FULL_SYNC] Troceo completado en %.1fs." % fases["Troceo"])
 
-    print("[FULL_SYNC] === Iniciando COMPARACION (ABD vs PSX) ===")
-    t_cmp = time.monotonic()
-    lineas_put, lineas_del = comparar(prefijos)
-    fases["Comparacion"] = time.monotonic() - t_cmp
-    print("[FULL_SYNC] Comparacion completada en %.1fs." % fases["Comparacion"])
-    # Conteos de diferencias generadas, para el resumen final.
-    n_ported = len(lineas_put)
-    n_deleted = len(lineas_del)
+      print("[FULL_SYNC] === Iniciando COMPARACION (ABD vs PSX) ===")
+      t_cmp = time.monotonic()
+      lineas_put, lineas_del = comparar(prefijos)
+      fases["Comparacion"] = time.monotonic() - t_cmp
+      print("[FULL_SYNC] Comparacion completada en %.1fs." % fases["Comparacion"])
+      # Conteos de diferencias generadas, para el resumen final.
+      n_ported = len(lineas_put)
+      n_deleted = len(lineas_del)
 
-    print("[FULL_SYNC] === Escribiendo CSV de diferencias ===")
-    escribir_salida("PORTED", label, lineas_put)
-    escribir_salida("DELETED", label, lineas_del)
+      print("[FULL_SYNC] === Escribiendo CSV de diferencias ===")
+      escribir_salida("PORTED", label, lineas_put)
+      escribir_salida("DELETED", label, lineas_del)
 
-    limpiar_intermedios(prefijos)
+      limpiar_intermedios(prefijos)
 
   etiqueta = (" [%s]" % label) if label else ""
 
@@ -926,8 +1001,14 @@ def main():
     for nombre in ("Descarga ABD", "Descarga PSX", "Troceo", "Comparacion", "Ejecucion"):
       if nombre in fases:
         cuerpo.append("  %-15s %s" % (nombre + ":", formatear_duracion(fases[nombre])))
-    cuerpo.append("Diferencias:      PORTED %s | DELETED %s"
-                  % (_fmt_diff(n_ported), _fmt_diff(n_deleted)))
+    # Con --download-only no hubo comparacion, asi que no hay diferencias que
+    # reportar: decirlo explicitamente en vez de un "no disponible" que suena a
+    # fallo de lectura del CSV.
+    if args.download_only:
+      cuerpo.append("Diferencias:      no calculadas (--download-only)")
+    else:
+      cuerpo.append("Diferencias:      PORTED %s | DELETED %s"
+                    % (_fmt_diff(n_ported), _fmt_diff(n_deleted)))
     cuerpo += list(lineas_exec)
     cuerpo.append("Resultado:        %s" % estado_txt)
     cuerpo.append("===================================")
@@ -940,6 +1021,35 @@ def main():
     # send_notification respeta NOTIFY_SUMMARY y solo envia si esta activo).
     asunto = "[Portabilidad] RESUMEN FULL SYNC%s - %s" % (etiqueta, estado_txt)
     mtysajpsx01.send_notification("summary", asunto, "\n".join(cuerpo) + "\n")
+
+  # --download-only: fin del trabajo. Se reportan los CSV que quedaron en disco y
+  # como reusarlos luego sin volver a bajar las BD.
+  if args.download_only:
+    print("[FULL_SYNC] --download-only: descarga terminada. Se omitio troceo, "
+          "comparacion, escritura de diferencias y ejecucion.")
+    print("[FULL_SYNC] Archivos descargados (conservados en %s):" % SYNC_WORKDIR)
+    for base in ("abd", "psx"):
+      ruta = os.path.join(SYNC_WORKDIR, "%s.csv" % base)
+      if args.only and args.only != base:
+        print("[FULL_SYNC]   %s (omitida por --only %s)" % (ruta, args.only))
+      elif os.path.isfile(ruta):
+        print("[FULL_SYNC]   %s (%s)" % (ruta, peso_archivo(ruta)))
+      else:
+        print("[FULL_SYNC]   %s (no generado en esta corrida)" % ruta)
+    # Con --only falta la otra base, asi que comparar aun requiere bajarla: se
+    # sugiere el comando que baja SOLO la que falta y luego el que compara.
+    sufijo = (" --label %s" % label) if label else ""
+    if args.only:
+      falta = "psx" if args.only == "abd" else "abd"
+      print("[FULL_SYNC] Falta %s para poder comparar. Bajala con: "
+            "python3 full_sync.py --download-only --only %s" % (falta.upper(), falta))
+      print("[FULL_SYNC] Y despues compara sin volver a bajar ninguna: "
+            "SKIP_DB_DOWNLOAD=true python3 full_sync.py%s" % sufijo)
+    else:
+      print("[FULL_SYNC] Para comparar despues sin volver a bajarlas: "
+            "SKIP_DB_DOWNLOAD=true python3 full_sync.py%s" % sufijo)
+    _imprimir_resumen("OK (solo descarga, sin comparar ni ejecutar)", [], sys.stdout)
+    return 0
 
   # 3) Ejecucion de las diferencias contra el equipo (salvo --no-execute).
   #    Reutiliza el pipeline completo de mtysajpsx01 (chunks, reintentos,

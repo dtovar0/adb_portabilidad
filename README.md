@@ -92,8 +92,44 @@ python mtysajpsx01.py --date 20260727 --type PORTED             # solo altas
 # Full sync: snapshot completo, compara ABD vs PSX (sin fechas)
 python full_sync.py
 python full_sync.py --no-execute    # solo genera los CSV, no toca el equipo
+python full_sync.py --download-only # solo baja las BD (abd.csv/psx.csv), nada más
 python full_sync.py --check         # solo compara conteos (sale 1 si no cuadran)
 ```
+
+`--download-only` se detiene justo después de la descarga: deja `abd.csv` y
+`psx.csv` en `SYNC_WORKDIR` y **no** trocea, compara, genera diferencias ni
+ejecuta contra el equipo (tampoco exige la configuración del equipo). Conserva
+los intermedios automáticamente, así que la comparación se puede hacer después
+sin volver a bajar decenas de millones de filas:
+
+```bash
+python full_sync.py --download-only              # bajar ahora
+SKIP_DB_DOWNLOAD=true python full_sync.py        # comparar/ejecutar después
+```
+
+Por defecto baja **las dos** bases. Para bajar solo una, usa `--only`:
+
+```bash
+python full_sync.py --download-only --only abd   # solo ABD
+python full_sync.py --download-only --only psx   # solo PSX
+```
+
+`--only` omite la otra base por completo, sin exigir que su CSV exista — es la
+diferencia con `SKIP_ABD`/`SKIP_PSX`, que significan *"reusa el CSV previo"* y
+abortan con código `2` si no está en el workdir. Solo se acepta junto a
+`--download-only`: comparar con una sola base recién bajada generaría diferencias
+falsas, o sea altas y bajas indebidas contra el equipo.
+
+Bajar cada base por separado y comparar al final:
+
+```bash
+python full_sync.py --download-only --only abd
+python full_sync.py --download-only --only psx
+SKIP_DB_DOWNLOAD=true python full_sync.py        # compara sin volver a bajar
+```
+
+Si necesitas conservar los intermedios en una corrida *normal* (sin tocar el
+`.env`), usa `--keep-intermediate`.
 
 El diario **va un día atrás**: el CSV de un día se genera al día siguiente, así
 que rechaza cualquier fecha `>= hoy`. Los domingos y festivos se omiten según
