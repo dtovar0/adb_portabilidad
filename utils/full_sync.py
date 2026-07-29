@@ -871,13 +871,18 @@ def main():
   # asi se compara todo de una sola pasada reutilizando la misma logica.
   # Los prefijos cubren SIEMPRE toda la numeracion (base 2..9); SYNC_DEPTH solo
   # controla que tan fino es el loteo para reducir memoria, no un subconjunto.
+  # El loteo solo interviene en el troceo y la comparacion, asi que con
+  # --download-only (que corta antes) no se anuncia: seria ruido enganoso. La
+  # lista se calcula igual porque limpiar_intermedios() la necesita.
   if SYNC_BATCH_ENABLED:
     prefijos = generar_prefijos(SYNC_DEPTH)
-    print("[FULL_SYNC] Loteo HABILITADO (depth=%d => %d lote(s))."
-          % (SYNC_DEPTH, len(prefijos)))
+    if not args.download_only:
+      print("[FULL_SYNC] Loteo HABILITADO (depth=%d => %d lote(s))."
+            % (SYNC_DEPTH, len(prefijos)))
   else:
     prefijos = [""]
-    print("[FULL_SYNC] Loteo DESHABILITADO: comparacion en una sola pasada.")
+    if not args.download_only:
+      print("[FULL_SYNC] Loteo DESHABILITADO: comparacion en una sola pasada.")
 
   # Conteos de diferencias generadas. Quedan en None si esta corrida no compara
   # (SKIP_COMPARE reusa los CSV previos): el resumen los marca como "no calculado".
